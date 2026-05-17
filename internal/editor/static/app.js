@@ -103,6 +103,7 @@ const ui = {
   resetObjectBtn: document.getElementById("resetObjectBtn"),
   deleteObjectBtn: document.getElementById("deleteObjectBtn"),
   showObjectCollision: document.getElementById("showObjectCollision"),
+  showHandoffOverlay: document.getElementById("showHandoffOverlay"),
   objectSaveStatus: document.getElementById("objectSaveStatus"),
   spawnSection: document.getElementById("spawnSection"),
   spawnFilter: document.getElementById("spawnFilter"),
@@ -139,6 +140,7 @@ const state = {
   lightmapStrength: 0.6,       // 0 = no lightmap, 1 = full bake
   showNVMOverlay: false,
   showObjectCollision: false,
+  showHandoffOverlay: false,
   undoStack: [],
   redoStack: [],
   undoLimit: 100,
@@ -291,6 +293,10 @@ const objectColorBuffer = gl.createBuffer();
 const selectionBuffer = gl.createBuffer();
 const collisionFillBuffer = gl.createBuffer();
 const collisionLineBuffer = gl.createBuffer();
+const handoffOpenFillBuffer = gl.createBuffer();
+const handoffClosedFillBuffer = gl.createBuffer();
+const handoffOpenLineBuffer = gl.createBuffer();
+const handoffClosedLineBuffer = gl.createBuffer();
 
 gl.enable(gl.DEPTH_TEST);
 gl.disable(gl.CULL_FACE);
@@ -354,6 +360,11 @@ ui.showNVMOverlay.addEventListener("change", () => {
 });
 ui.showObjectCollision.addEventListener("change", () => {
   state.showObjectCollision = ui.showObjectCollision.checked;
+});
+ui.showHandoffOverlay.addEventListener("change", () => {
+  state.showHandoffOverlay = ui.showHandoffOverlay.checked;
+  if (state.showHandoffOverlay) state.showNVMOverlay = true;
+  ui.showNVMOverlay.checked = state.showNVMOverlay;
 });
 
 // Persist tuning sliders across reloads
@@ -732,6 +743,7 @@ async function loadRegionNVMCells(region) {
     if (!data.ok) return;
     const json = await data.json();
     region.nvmCells = json.cells || [];
+    region.nvmObjects = json.objects || [];
     region.nvmOpenCount = json.openCount || 0;
     buildNVMOverlayBuffers(region);
   } catch (_) { /* no NVM */ }
@@ -2743,6 +2755,7 @@ function draw() {
   drawSelectionBox(viewProj);
 
   if (state.showNVMOverlay) drawNVMOverlay(viewProj);
+  if (state.showHandoffOverlay) drawSelectedHandoffOverlay(viewProj);
 
   if (state.toolMode === "brush" && state.hover) drawBrushCircle(viewProj);
 }
@@ -2768,6 +2781,100 @@ function drawNVMOverlay(viewProj) {
     }
   }
   gl.enable(gl.DEPTH_TEST);
+}
+
+function drawSelectedHandoffOverlay(viewProj) {
+  if (!state.selection) return;
+  const placement = state.objectPlacements[state.selection.index];
+  if (!placement) return;
+
+  const openFill = [];
+  const closedFill = [];
+  const openLines = [];
+  const closedLines = [];
+
+  for (const region of state.regions.values()) {
+    const objectIndex = matchingNVMObjectIndex(region, placement);
+    if (objectIndex < 0) continue;
+    const cells = region.nvmCells || [];
+    for (const cell of cells) {
+      const indices = cell.objectIndices || [];
+      if (!indices.includes(objectIndex)) continue;
+      const fill = cell.open ? openFill : closedFill;
+      const lines = cell.open ? openLines : closedLines;
+      pushNVMCellSurface(fill, lines, region, cell, 8);
+    }
+  }
+
+  if (openFill.length === 0 && closedFill.length === 0) return;
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.useProgram(flatProgram.program);
+  gl.uniformMatrix4fv(flatProgram.uniforms.uViewProj, false, viewProj);
+  drawFlatBatch(handoffOpenFillBuffer, openFill, [0.0, 0.72, 1.0, 0.28]);
+  drawFlatBatch(handoffClosedFillBuffer, closedFill, [1.0, 0.52, 0.08, 0.24]);
+
+  gl.disable(gl.BLEND);
+  gl.useProgram(lineProgram.program);
+  gl.uniformMatrix4fv(lineProgram.uniforms.uViewProj, false, viewProj);
+  drawLineBatch(handoffOpenLineBuffer, openLines, [0.0, 0.9, 1.0]);
+  drawLineBatch(handoffClosedLineBuffer, closedLines, [1.0, 0.62, 0.1]);
+  gl.enable(gl.DEPTH_TEST);
+}
+
+function matchingNVMObjectIndex(region, placement) {
+  const objects = region.nvmObjects || [];
+  for (const obj of objects) {
+    if (Number(obj.assetID) !== Number(placement.objID)) continue;
+    if (Number(obj.uid) !== Number(placement.uid)) continue;
+    if (Number(obj.regionID) !== Number(placement.regionID)) continue;
+    return Number(obj.index);
+  }
+  return -1;
+}
+
+function pushNVMCellSurface(fill, lines, region, cell, yOffset) {
+  const corners = nvmCellWorldCorners(region, cell, yOffset);
+  pushTri(fill, corners[0], corners[1], corners[2]);
+  pushTri(fill, corners[0], corners[2], corners[3]);
+  pushLine(lines, corners[0], corners[1]);
+  pushLine(lines, corners[1], corners[2]);
+  pushLine(lines, corners[2], corners[3]);
+  pushLine(lines, corners[3], corners[0]);
+}
+
+function nvmCellWorldCorners(region, cell, yOffset) {
+  const offX = regionOffsetX(region.x);
+  const offZ = regionOffsetZ(region.y);
+  const w0X = offX + 960 - cell.maxX;
+  const w1X = offX + 960 - cell.minX;
+  const w0Z = offZ - 960 + cell.minZ;
+  const w1Z = offZ - 960 + cell.maxZ;
+  return [[w0X, w0Z], [w1X, w0Z], [w1X, w1Z], [w0X, w1Z]].map(([x, z]) => {
+    const h = heightAtWorld(x, z);
+    return [x, (h ? h.height : 0) + yOffset, z];
+  });
+}
+
+function drawFlatBatch(buffer, verts, color) {
+  if (verts.length === 0) return;
+  gl.uniform4fv(flatProgram.uniforms.uColor, color);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+  bindAttribute(flatProgram.attributes.aPosition, buffer, 3);
+  gl.drawArrays(gl.TRIANGLES, 0, verts.length / 3);
+}
+
+function drawLineBatch(buffer, verts, color) {
+  if (verts.length === 0) return;
+  gl.uniform3fv(lineProgram.uniforms.uColor, color);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+  bindAttribute(lineProgram.attributes.aPosition, buffer, 3);
+  gl.drawArrays(gl.LINES, 0, verts.length / 3);
 }
 
 function drawObjectCollisionOverlay(viewProj) {

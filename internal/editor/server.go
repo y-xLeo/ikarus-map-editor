@@ -351,22 +351,53 @@ func (s *Server) handleRegionNVMCells(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type cell struct {
-		MinX float32 `json:"minX"`
-		MinZ float32 `json:"minZ"`
-		MaxX float32 `json:"maxX"`
-		MaxZ float32 `json:"maxZ"`
-		Open bool    `json:"open"`
+		Index         int      `json:"index"`
+		MinX          float32  `json:"minX"`
+		MinZ          float32  `json:"minZ"`
+		MaxX          float32  `json:"maxX"`
+		MaxZ          float32  `json:"maxZ"`
+		Open          bool     `json:"open"`
+		ObjectIndices []uint16 `json:"objectIndices,omitempty"`
+	}
+	type object struct {
+		Index    int     `json:"index"`
+		AssetID  uint32  `json:"assetID"`
+		UID      int16   `json:"uid"`
+		RegionID uint16  `json:"regionID"`
+		X        float32 `json:"x"`
+		Y        float32 `json:"y"`
+		Z        float32 `json:"z"`
+		Yaw      float32 `json:"yaw"`
+		Links    int     `json:"links,omitempty"`
 	}
 	cells := make([]cell, len(nvm.Cells))
 	for i, c := range nvm.Cells {
+		objectIndices := append([]uint16(nil), c.ObjectIndices...)
 		cells[i] = cell{
-			MinX: c.MinX, MinZ: c.MinZ, MaxX: c.MaxX, MaxZ: c.MaxZ,
-			Open: uint32(i) < nvm.OpenCellCount,
+			Index: i,
+			MinX:  c.MinX, MinZ: c.MinZ, MaxX: c.MaxX, MaxZ: c.MaxZ,
+			Open:          uint32(i) < nvm.OpenCellCount,
+			ObjectIndices: objectIndices,
+		}
+	}
+	objects := make([]object, len(nvm.Objects))
+	for i, obj := range nvm.Objects {
+		objects[i] = object{
+			Index:    i,
+			AssetID:  obj.AssetID,
+			UID:      obj.UID,
+			RegionID: obj.RegionID,
+			X:        obj.X,
+			Y:        obj.Y,
+			Z:        obj.Z,
+			Yaw:      obj.Yaw,
+			Links:    len(obj.Links),
 		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, map[string]any{
 		"cells":     cells,
+		"objects":   objects,
 		"openCount": nvm.OpenCellCount,
 	})
 }

@@ -3,6 +3,7 @@ package editor
 import (
 	"math"
 	"os"
+	"strings"
 
 	"sromapedit/internal/sromap"
 )
@@ -402,16 +403,35 @@ func orient2D(ax, az, bx, bz, cx, cz float32) float32 {
 }
 
 func (s *Server) addMapOnlyObjectIndices(nvm *sromap.NVM) {
+	const bridgeHandoffPad = float32(sromap.NVMTileSize * 2)
 	for objIdx, obj := range nvm.Objects {
 		asset, _ := s.objCache.get(obj.AssetID)
 		if !assetHasMapOnlyCollision(asset) {
 			continue
 		}
 		minX, maxX, minZ, maxZ := nvmObjectRotatedBBox(obj, asset)
+		var triangles []navTriangle2D
+		preciseFootprint := false
+		if assetUsesPreciseMapOnlyObjectCells(asset) {
+			if t, ok := transformedCollisionTriangles(nvmObjectAsPlacement(obj), asset); ok {
+				triangles = t
+				minX, maxX, minZ, maxZ = navTriangleBounds(t, bridgeHandoffPad)
+				preciseFootprint = true
+			}
+		}
 		for ci := range nvm.Cells {
 			cell := &nvm.Cells[ci]
 			if minF(cell.MaxX, maxX)-maxF(cell.MinX, minX) <= 0 ||
 				minF(cell.MaxZ, maxZ)-maxF(cell.MinZ, minZ) <= 0 {
+				continue
+			}
+			if preciseFootprint && !trianglesIntersectRect(
+				triangles,
+				cell.MinX-bridgeHandoffPad,
+				cell.MinZ-bridgeHandoffPad,
+				cell.MaxX+bridgeHandoffPad,
+				cell.MaxZ+bridgeHandoffPad,
+			) {
 				continue
 			}
 			if len(cell.ObjectIndices) >= 255 {
@@ -420,6 +440,50 @@ func (s *Server) addMapOnlyObjectIndices(nvm *sromap.NVM) {
 			cell.ObjectIndices = append(cell.ObjectIndices, uint16(objIdx))
 		}
 	}
+}
+
+func assetUsesPreciseMapOnlyObjectCells(asset *objectAsset) bool {
+	if asset == nil {
+		return false
+	}
+	name := strings.ToLower(asset.Source + " " + asset.Name)
+	return strings.Contains(name, "bridge") || strings.Contains(name, "brid")
+}
+
+func nvmObjectAsPlacement(obj sromap.NVMObject) sromap.ObjectEntry {
+	return sromap.ObjectEntry{
+		ObjID:    obj.AssetID,
+		X:        obj.X,
+		Y:        obj.Y,
+		Z:        obj.Z,
+		Yaw:      obj.Yaw,
+		UID:      obj.UID,
+		RegionID: obj.RegionID,
+	}
+}
+
+func navTriangleBounds(triangles []navTriangle2D, pad float32) (minX, maxX, minZ, maxZ float32) {
+	minX, maxX = float32(math.MaxFloat32), float32(-math.MaxFloat32)
+	minZ, maxZ = float32(math.MaxFloat32), float32(-math.MaxFloat32)
+	for _, t := range triangles {
+		for _, x := range [3]float32{t.x0, t.x1, t.x2} {
+			if x < minX {
+				minX = x
+			}
+			if x > maxX {
+				maxX = x
+			}
+		}
+		for _, z := range [3]float32{t.z0, t.z1, t.z2} {
+			if z < minZ {
+				minZ = z
+			}
+			if z > maxZ {
+				maxZ = z
+			}
+		}
+	}
+	return minX - pad, maxX + pad, minZ - pad, maxZ + pad
 }
 
 type nvmObjectRefKey struct {
