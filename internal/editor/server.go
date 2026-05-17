@@ -245,6 +245,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/region/create", s.handleCreateRegions)
 	mux.HandleFunc("/api/region/delete", s.handleDeleteRegions)
 	mux.HandleFunc("/api/region/duplicate", s.handleDuplicateRegions)
+	mux.HandleFunc("/api/worldmap/texture", s.handleWorldMapTexture)
 	mux.HandleFunc("/api/tile", s.handleTile)
 	mux.HandleFunc("/api/tiles", s.handleTiles)
 	mux.HandleFunc("/api/object", s.handleObject)
@@ -898,6 +899,39 @@ func (s *Server) handleRegionTexture(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(rt.png)
 }
 
+func (s *Server) handleWorldMapTexture(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if len(s.tiles) == 0 {
+		writeError(w, http.StatusNotFound, "tile2d.ifo not loaded")
+		return
+	}
+	scale := 8
+	if v := r.URL.Query().Get("scale"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			scale = parsed
+		}
+	}
+	if scale < 2 {
+		scale = 2
+	}
+	if scale > 16 {
+		scale = 16
+	}
+	rt, err := s.textures.worldMapTexture(s.Root, s.mapInfo, scale)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "private, max-age=600")
+	w.Header().Set("X-Texture-Size", fmt.Sprintf("%dx%d", rt.width, rt.height))
+	w.Header().Set("X-WorldMap-Scale", strconv.Itoa(scale))
+	_, _ = w.Write(rt.png)
+}
+
 func (s *Server) handleRegionTexturePreview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1091,6 +1125,7 @@ func (s *Server) handleCreateRegions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "write mesh "+meshPath+": "+err.Error())
 			return
 		}
+		s.textures.invalidateRegion(rg.X, rg.Y)
 		_ = s.mirrorToExport(meshPath)
 
 		// Generate a clean minimal NVM next to the mesh so the server can

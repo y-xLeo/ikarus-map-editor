@@ -387,6 +387,7 @@ code {
 .dock-panel[hidden] { display: none; }
 .dock-panel.dragging { transition: none; cursor: grabbing; box-shadow: var(--shadow-lg), 0 0 0 1px var(--accent-ring), 0 0 30px var(--accent-glow); }
 .dock-panel.dock-panel-compact { width: 260px; }
+#statsPanel { width: 310px; }
 
 @keyframes panelIn {
   from { opacity: 0; transform: translateY(-6px) scale(0.985); }
@@ -719,16 +720,12 @@ input[type="range"]::-moz-range-thumb {
 #loadBtn,
 #bakeShadowsBtn,
 #restoreLightmapBtn,
-#rebuildNVMBtn,
-#restoreNVMBtn,
 #snapToTerrainBtn,
 #resetObjectBtn,
 #deleteObjectBtn,
 #importCustomObjectBtn { width: 100%; }
 #importCustomObjectBtn { margin-bottom: 8px; }
 
-#rebuildNVMBtn:disabled,
-#restoreNVMBtn:disabled,
 #bakeShadowsBtn:disabled,
 #restoreLightmapBtn:disabled { cursor: progress; }
 

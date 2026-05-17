@@ -112,9 +112,6 @@
     <button class="rail-btn" data-panel="lightingPanel" data-tooltip="Lighting · shadow bake">
       <svg class="rail-icon"><use href="#icon-sun"/></svg>
     </button>
-    <button class="rail-btn" data-panel="nvmPanel" data-tooltip="Navmesh · NVM rebuild">
-      <svg class="rail-icon"><use href="#icon-mesh"/></svg>
-    </button>
     <button class="rail-btn" data-panel="worldMapTrigger" data-tooltip="World map (M)">
       <svg class="rail-icon"><use href="#icon-globe"/></svg>
     </button>
@@ -235,35 +232,6 @@
     </div>
   </aside>
 
-  <aside class="dock-panel" id="nvmPanel" hidden>
-    <header class="dock-header" data-drag-handle>
-      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
-      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-mesh"/></svg></span>
-      <h2 class="dock-title">Navmesh (NVM)</h2>
-      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
-    </header>
-    <div class="dock-body">
-      <label class="check"><input id="showNVMOverlay" type="checkbox"> <span>Show NVM cells <kbd>N</kbd></span></label>
-      <details id="nvmSettings" class="dock-details">
-        <summary><span>Advanced NVM</span><svg class="ico chev"><use href="#icon-chevron"/></svg></summary>
-        <div class="details-body">
-          <p class="hint">Save automatically runs the map-only NVM rebuild for changed regions and their neighbours. Use this only for manual rebuilds or rollback.</p>
-          <div class="slider-block">
-            <div class="slider-head"><span class="slider-name" title="Slope limit in degrees. 0 disables slope blocking.">Slope limit</span><output id="nvmSlopeOut" class="slider-val">60</output></div>
-            <input id="nvmSlope" type="range" min="0" max="100" step="1" value="60">
-          </div>
-          <label class="check" title="Create a new .nvm for regions that have no existing one during manual rebuilds.">
-            <input id="nvmCreateMissing" type="checkbox" checked> <span>Create NVM if missing</span>
-          </label>
-          <div class="btn-row">
-            <button id="rebuildNVMBtn" class="btn btn-primary" type="button">Rebuild loaded</button>
-            <button id="restoreNVMBtn" class="btn btn-ghost" type="button">Restore</button>
-          </div>
-        </div>
-      </details>
-    </div>
-  </aside>
-
   <aside class="dock-panel dock-panel-compact" id="statsPanel" hidden>
     <header class="dock-header" data-drag-handle>
       <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
@@ -278,6 +246,15 @@
         <dt>Objects</dt><dd id="objectCount">0</dd>
         <dt>Active map</dt><dd id="activeCount">0</dd>
         <dt>RefRegion</dt><dd id="refText">None</dd>
+        <dt>FPS</dt><dd id="perfFPS">-</dd>
+        <dt>Frame</dt><dd id="perfFrameMs">-</dd>
+        <dt>Regions</dt><dd id="perfRegions">-</dd>
+        <dt>Evicted</dt><dd id="perfEvictedRegions">0</dd>
+        <dt>Objects drawn</dt><dd id="perfObjects">-</dd>
+        <dt>Culled objects</dt><dd id="perfCulledObjects">-</dd>
+        <dt>Draw calls</dt><dd id="perfDrawCalls">-</dd>
+        <dt>Tile preview</dt><dd id="perfTilePreview">-</dd>
+        <dt>GPU textures</dt><dd id="perfTextures">-</dd>
         <dt>Export</dt><dd id="exportDir" title="Saved files mirror here. Copy contents into your client / server.">-</dd>
       </dl>
     </div>

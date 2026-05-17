@@ -38,6 +38,9 @@ type textureCache struct {
 	lightmapMu       sync.Mutex
 	lightmaps        map[string]*lightmapEntry
 	lightmapVersions map[string]int
+
+	worldMapMu sync.Mutex
+	worldMaps  map[int]*regionTexture
 }
 
 type regionTexture struct {
@@ -66,6 +69,7 @@ func newTextureCache(root string, table map[uint32]sromap.Tile2DEntry) *textureC
 		regionVersions:   make(map[string]int),
 		lightmaps:        make(map[string]*lightmapEntry),
 		lightmapVersions: make(map[string]int),
+		worldMaps:        make(map[int]*regionTexture),
 	}
 }
 
@@ -221,12 +225,169 @@ func (c *textureCache) regionCompositePatchGridFromIDs(ids []uint16, minTileX, m
 	return &regionTexture{png: buf.Bytes(), width: composite.Bounds().Dx(), height: composite.Bounds().Dy()}, nil
 }
 
+func (c *textureCache) worldMapTexture(root string, mapInfo *sromap.MapInfo, scale int) (*regionTexture, error) {
+	c.worldMapMu.Lock()
+	if existing, ok := c.worldMaps[scale]; ok {
+		c.worldMapMu.Unlock()
+		return existing, nil
+	}
+	c.worldMapMu.Unlock()
+
+	img := image.NewRGBA(image.Rect(0, 0, 256*scale, 128*scale))
+	fillRGBA(img, color.RGBA{8, 11, 9, 255})
+
+	for _, region := range mapInfo.ActiveRegions() {
+		if region.IsDungeon {
+			continue
+		}
+		mesh, err := sromap.LoadMesh(sromap.MeshPath(root, region.X, region.Y))
+		if err != nil {
+			fillWorldMapRegion(img, region.X, region.Y, scale, color.RGBA{45, 68, 47, 255})
+			continue
+		}
+		ids, _, _ := mesh.UniqueTextureMap()
+		c.drawWorldMapRegion(img, ids[:], region.X, region.Y, scale)
+	}
+
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	rt := &regionTexture{png: buf.Bytes(), width: img.Bounds().Dx(), height: img.Bounds().Dy()}
+	c.worldMapMu.Lock()
+	c.worldMaps[scale] = rt
+	c.worldMapMu.Unlock()
+	return rt, nil
+}
+
+func (c *textureCache) drawWorldMapRegion(out *image.RGBA, ids []uint16, rx, ry, scale int) {
+	if len(ids) != sromap.MeshGridSize*sromap.MeshGridSize {
+		fillWorldMapRegion(out, rx, ry, scale, color.RGBA{96, 84, 64, 255})
+		return
+	}
+	used := make(map[uint16]*sromap.DDJImage)
+	fallback := color.RGBA{96, 84, 64, 255}
+	baseX := rx * scale
+	baseY := (127 - ry) * scale
+	for py := 0; py < scale; py++ {
+		mapV := 1 - (float32(py)+0.5)/float32(scale)
+		tileZf := mapV * float32(compositeTiles)
+		tileZ := int(tileZf)
+		if tileZ < 0 {
+			tileZ = 0
+		}
+		if tileZ >= compositeTiles {
+			tileZ = compositeTiles - 1
+		}
+		blendV := tileZf - float32(tileZ)
+		if blendV < 0 {
+			blendV = 0
+		}
+		if blendV > 1 {
+			blendV = 1
+		}
+		for px := 0; px < scale; px++ {
+			mapU := (float32(px) + 0.5) / float32(scale)
+			tileXf := mapU * float32(compositeTiles)
+			tileX := int(tileXf)
+			if tileX < 0 {
+				tileX = 0
+			}
+			if tileX >= compositeTiles {
+				tileX = compositeTiles - 1
+			}
+			blendU := tileXf - float32(tileX)
+			if blendU < 0 {
+				blendU = 0
+			}
+			if blendU > 1 {
+				blendU = 1
+			}
+			r, g, b := c.worldMapSample(ids, used, tileX, tileZ, blendU, blendV, mapU, 1-mapV, fallback)
+			off := out.PixOffset(baseX+px, baseY+py)
+			out.Pix[off] = r
+			out.Pix[off+1] = g
+			out.Pix[off+2] = b
+			out.Pix[off+3] = 255
+		}
+	}
+}
+
+func (c *textureCache) worldMapSample(ids []uint16, used map[uint16]*sromap.DDJImage, tileX, tileZ int, blendU, blendV, texU, texV float32, fallback color.RGBA) (byte, byte, byte) {
+	i00 := tileZ*sromap.MeshGridSize + tileX
+	i10 := i00 + 1
+	i01 := i00 + sromap.MeshGridSize
+	i11 := i01 + 1
+	tex00 := c.cachedWorldMapTile(used, ids[i00])
+	tex10 := c.cachedWorldMapTile(used, ids[i10])
+	tex01 := c.cachedWorldMapTile(used, ids[i01])
+	tex11 := c.cachedWorldMapTile(used, ids[i11])
+	oneU := 1 - blendU
+	oneV := 1 - blendV
+	w00 := oneU * oneV
+	w10 := blendU * oneV
+	w01 := oneU * blendV
+	w11 := blendU * blendV
+	r00, g00, b00 := sampleNearest(tex00, texU, texV, fallback)
+	r10, g10, b10 := sampleNearest(tex10, texU, texV, fallback)
+	r01, g01, b01 := sampleNearest(tex01, texU, texV, fallback)
+	r11, g11, b11 := sampleNearest(tex11, texU, texV, fallback)
+	r := float32(r00)*w00 + float32(r10)*w10 + float32(r01)*w01 + float32(r11)*w11
+	g := float32(g00)*w00 + float32(g10)*w10 + float32(g01)*w01 + float32(g11)*w11
+	b := float32(b00)*w00 + float32(b10)*w10 + float32(b01)*w01 + float32(b11)*w11
+	return clampByte(r), clampByte(g), clampByte(b)
+}
+
+func (c *textureCache) cachedWorldMapTile(used map[uint16]*sromap.DDJImage, id uint16) *sromap.DDJImage {
+	key := id & 0x7FF
+	if img, ok := used[key]; ok {
+		return img
+	}
+	img := c.decoded(uint32(key))
+	used[key] = img
+	return img
+}
+
+func fillRGBA(img *image.RGBA, c color.RGBA) {
+	for y := img.Rect.Min.Y; y < img.Rect.Max.Y; y++ {
+		for x := img.Rect.Min.X; x < img.Rect.Max.X; x++ {
+			off := img.PixOffset(x, y)
+			img.Pix[off] = c.R
+			img.Pix[off+1] = c.G
+			img.Pix[off+2] = c.B
+			img.Pix[off+3] = c.A
+		}
+	}
+}
+
+func fillWorldMapRegion(img *image.RGBA, rx, ry, scale int, c color.RGBA) {
+	baseX := rx * scale
+	baseY := (127 - ry) * scale
+	for py := 0; py < scale; py++ {
+		for px := 0; px < scale; px++ {
+			off := img.PixOffset(baseX+px, baseY+py)
+			img.Pix[off] = c.R
+			img.Pix[off+1] = c.G
+			img.Pix[off+2] = c.B
+			img.Pix[off+3] = c.A
+		}
+	}
+}
+
 func (c *textureCache) invalidateRegion(x, y int) {
 	key := fmt.Sprintf("%d,%d", x, y)
 	c.regionMu.Lock()
 	delete(c.regions, key)
 	c.regionVersions[key]++
 	c.regionMu.Unlock()
+	c.invalidateWorldMap()
+}
+
+func (c *textureCache) invalidateWorldMap() {
+	c.worldMapMu.Lock()
+	c.worldMaps = make(map[int]*regionTexture)
+	c.worldMapMu.Unlock()
 }
 
 func (c *textureCache) regionVersion(x, y int) int {

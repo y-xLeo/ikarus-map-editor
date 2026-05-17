@@ -3,7 +3,12 @@ const CELL_SIZE = 20;
 const GRID_SIZE = 97;
 const COMPOSITE_TILE_SIZE = 16;
 const COMPOSITE_TILES = GRID_SIZE - 1;
+const TILE_TEXTURE_REPEAT = 8;
+const DEFAULT_NVM_SLOPE = 60;
 const BRUSH_CIRCLE_SEGMENTS = 96;
+const OBJECT_CULL_PADDING = 350;
+const TILE_PREVIEW_FALLBACK_RGBA = [96, 84, 64, 255];
+const REGION_EVICT_EXTRA_RADIUS = 2;
 const BRUSH_CIRCLE_UNIT = (() => {
   const data = new Float32Array(BRUSH_CIRCLE_SEGMENTS * 2);
   for (let i = 0; i < BRUSH_CIRCLE_SEGMENTS; i++) {
@@ -14,6 +19,10 @@ const BRUSH_CIRCLE_UNIT = (() => {
   return data;
 })();
 const brushCircleData = new Float32Array(BRUSH_CIRCLE_SEGMENTS * 3);
+const objectFrustumPlanes = Array.from({ length: 6 }, () => new Float32Array(4));
+const objectModelMatrix = new Float32Array(16);
+const objectMVPMatrix = new Float32Array(16);
+const objectTint = new Float32Array([0.7, 0.65, 0.55]);
 
 const canvas = document.getElementById("view");
 const gl = canvas.getContext("webgl", { antialias: true });
@@ -21,6 +30,8 @@ if (!gl) {
   document.getElementById("status").textContent = "WebGL is not available";
   throw new Error("WebGL is not available");
 }
+const tilePreviewCanvas = document.createElement("canvas");
+const tilePreviewCtx = tilePreviewCanvas.getContext("2d", { willReadFrequently: true });
 
 const ui = {
   status: document.getElementById("status"),
@@ -69,6 +80,15 @@ const ui = {
   objectCount: document.getElementById("objectCount"),
   activeCount: document.getElementById("activeCount"),
   refText: document.getElementById("refText"),
+  perfFPS: document.getElementById("perfFPS"),
+  perfFrameMs: document.getElementById("perfFrameMs"),
+  perfRegions: document.getElementById("perfRegions"),
+  perfEvictedRegions: document.getElementById("perfEvictedRegions"),
+  perfObjects: document.getElementById("perfObjects"),
+  perfCulledObjects: document.getElementById("perfCulledObjects"),
+  perfDrawCalls: document.getElementById("perfDrawCalls"),
+  perfTilePreview: document.getElementById("perfTilePreview"),
+  perfTextures: document.getElementById("perfTextures"),
   exportDir: document.getElementById("exportDir"),
   lightmapStrength: document.getElementById("lightmapStrength"),
   lightmapStrengthOut: document.getElementById("lightmapStrengthOut"),
@@ -135,6 +155,8 @@ const state = {
   baseY: 0,
   regions: new Map(),
   dirty: new Set(),
+  saving: false,
+  loadingRegion: false,
   objects: { count: 0, position: null, color: null },
   objectAssets: new Map(),     // objID -> { meshes:[{vbuf,ibuf,texture,count}], state, bbox }
   objectPlacements: [],        // { objID, uid, regionID, regionX, regionY, originalX/Y/Z, wx, wy, wz, yaw, objectPath, isNew? }
@@ -147,6 +169,7 @@ const state = {
   tileFilterText: "",
   activeTileID: null,          // selected tile ID for the Tile brush
   tileDirty: new Set(),        // region keys that had tile changes
+  tilePreviewCache: new Map(), // tile ID -> Promise<{width,height,pixels} | null>
   selection: null,             // { index: number } pointing into objectPlacements
   dragging: null,              // { planeY, offsetX, offsetZ, index } while dragging a selection
   toolMode: "brush",           // "brush" | "select"
@@ -174,6 +197,20 @@ const state = {
   mouse: { x: 0, y: 0 },
   camera: { x: 0, y: 700, z: 2200, yaw: Math.PI, pitch: -0.35 },
   lastFrame: performance.now(),
+  perf: {
+    fps: 0,
+    fpsFrames: 0,
+    fpsLastAt: performance.now(),
+    frameMs: 0,
+    terrainDrawCalls: 0,
+    objectDrawn: 0,
+    objectCulled: 0,
+    objectDrawCalls: 0,
+    tilePreviewMs: 0,
+    tilePreviewSource: "-",
+    evictedRegions: 0,
+    lastUIAt: 0
+  },
   // Dynamic region streaming
   streaming: true,
   streamingInFlight: new Set(),   // "x,y" of regions currently being loaded
@@ -188,6 +225,8 @@ const state = {
   worldMapPanX: 0,                // canvas-pixel offset
   worldMapPanY: 0,
   worldMapPanDrag: null,          // { x, y, panX, panY } while right-dragging
+  worldMapTextureImage: null,
+  worldMapTextureLoading: false,
   // Clipboard: source rect of active regions captured for paste
   worldMapClipboard: null         // { tiles: [{x,y}], minX, minY, w, h }
 };
@@ -367,20 +406,24 @@ state.lightmapStrength = parseFloat(ui.lightmapStrength.value);
 
 ui.bakeShadowsBtn.addEventListener("click", bakeLoadedRegionShadows);
 ui.restoreLightmapBtn.addEventListener("click", restoreLoadedRegionLightmaps);
-ui.rebuildNVMBtn.addEventListener("click", rebuildLoadedRegionNVMs);
-ui.restoreNVMBtn.addEventListener("click", restoreLoadedRegionNVMs);
-ui.nvmSlope.addEventListener("input", () => { ui.nvmSlopeOut.textContent = ui.nvmSlope.value; });
-ui.nvmSlopeOut.textContent = ui.nvmSlope.value;
-ui.showNVMOverlay.addEventListener("change", () => {
-  state.showNVMOverlay = ui.showNVMOverlay.checked;
-});
+if (ui.rebuildNVMBtn) ui.rebuildNVMBtn.addEventListener("click", rebuildLoadedRegionNVMs);
+if (ui.restoreNVMBtn) ui.restoreNVMBtn.addEventListener("click", restoreLoadedRegionNVMs);
+if (ui.nvmSlope && ui.nvmSlopeOut) {
+  ui.nvmSlope.addEventListener("input", () => { ui.nvmSlopeOut.textContent = ui.nvmSlope.value; });
+  ui.nvmSlopeOut.textContent = ui.nvmSlope.value;
+}
+if (ui.showNVMOverlay) {
+  ui.showNVMOverlay.addEventListener("change", () => {
+    state.showNVMOverlay = ui.showNVMOverlay.checked;
+  });
+}
 ui.showObjectCollision.addEventListener("change", () => {
   state.showObjectCollision = ui.showObjectCollision.checked;
 });
 ui.showHandoffOverlay.addEventListener("change", () => {
   state.showHandoffOverlay = ui.showHandoffOverlay.checked;
   if (state.showHandoffOverlay) state.showNVMOverlay = true;
-  ui.showNVMOverlay.checked = state.showNVMOverlay;
+  if (ui.showNVMOverlay) ui.showNVMOverlay.checked = state.showNVMOverlay;
 });
 
 // Persist tuning sliders across reloads
@@ -392,6 +435,7 @@ for (const [el, key] of [
   [ui.lightmapStrength, "lightmapStrength"],
   [ui.nvmSlope, "nvmSlope"]
 ]) {
+  if (!el) continue;
   try {
     const saved = localStorage.getItem(`sromap.${key}`);
     if (saved !== null) {
@@ -475,8 +519,16 @@ window.addEventListener("keydown", e => {
   }
   if (e.code === "KeyN" && !e.ctrlKey && !e.metaKey && !e.altKey) {
     state.showNVMOverlay = !state.showNVMOverlay;
-    ui.showNVMOverlay.checked = state.showNVMOverlay;
+    if (ui.showNVMOverlay) ui.showNVMOverlay.checked = state.showNVMOverlay;
     setStatus(state.showNVMOverlay ? "NVM overlay on" : "NVM overlay off");
+  }
+  if ((e.code === "Digit1" || e.code === "Numpad1") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    setToolMode("brush");
+    setStatus("Brush mode");
+  }
+  if ((e.code === "Digit2" || e.code === "Numpad2") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    setToolMode("select");
+    setStatus("Select mode");
   }
   if ((e.key === "m" || e.key === "M") && !e.ctrlKey && !e.metaKey && !e.altKey) {
     toggleWorldMap();
@@ -506,6 +558,12 @@ window.addEventListener("keydown", e => {
 });
 window.addEventListener("keyup", e => state.keys.delete(e.code));
 window.addEventListener("resize", resize);
+window.addEventListener("beforeunload", e => {
+  flushInProgressEdits();
+  if (!hasAnyUnsavedChanges()) return;
+  e.preventDefault();
+  e.returnValue = "";
+});
 
 canvas.addEventListener("contextmenu", e => e.preventDefault());
 canvas.addEventListener("mousedown", e => {
@@ -587,6 +645,20 @@ function clearMouseHeldState() {
     document.exitPointerLock?.();
   }
 }
+
+function flushInProgressEdits() {
+  const wasDragging = state.dragging !== null;
+  state.leftDown = false;
+  state.dragging = null;
+  if (state.editIdleTimer) {
+    clearTimeout(state.editIdleTimer);
+    state.editIdleTimer = 0;
+  }
+  if (wasDragging || state.editSession) endEditSession();
+  endBrushStroke();
+  refreshSaveDirtyState();
+}
+
 window.addEventListener("blur", clearMouseHeldState);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) clearMouseHeldState();
@@ -627,52 +699,68 @@ async function init() {
   resize();
   const info = await fetchJSON("/api/info");
   state.info = info;
+  loadWorldMapTexture();
   ui.activeCount.textContent = String(info.activeCount);
   if (ui.exportDir) ui.exportDir.textContent = info.exportDir || "(disabled)";
   ui.regionX.value = info.bounds.centerX;
   ui.regionY.value = info.bounds.centerY;
-  await loadSelectedRegion();
+  await loadSelectedRegion({ skipAutoSave: true });
 }
 
-async function loadSelectedRegion() {
-  const x = parseInt(ui.regionX.value, 10);
-  const y = parseInt(ui.regionY.value, 10);
-  const radius = clamp(parseInt(ui.loadRadius.value, 10) || 0, 0, 2);
-  state.baseX = x;
-  state.baseY = y;
-  for (const region of state.regions.values()) {
-    if (region.texture) gl.deleteTexture(region.texture);
-    if (region.lightmap) gl.deleteTexture(region.lightmap);
-    if (region.mesh) {
-      gl.deleteBuffer(region.mesh.position);
-      gl.deleteBuffer(region.mesh.color);
-      if (region.mesh.normal) gl.deleteBuffer(region.mesh.normal);
-      if (region.mesh.texCoord) gl.deleteBuffer(region.mesh.texCoord);
-    }
+async function loadSelectedRegion(opts = {}) {
+  if (state.loadingRegion) {
+    setStatus("Region load already in progress");
+    return;
   }
-  state.regions.clear();
-  state.dirty.clear();
-  setStatus(`Loading ${x},${y} radius ${radius}`);
+  state.loadingRegion = true;
+  try {
+    flushInProgressEdits();
+    if (!opts.skipAutoSave && hasAnyUnsavedChanges()) {
+      setStatus("Saving current edits before loading another region...");
+      let ok = false;
+      try {
+        ok = await saveAll({ throwOnError: true });
+      } catch (_) {
+        return;
+      }
+      if (!ok || hasAnyUnsavedChanges()) return;
+    }
 
-  const requests = [];
-  for (let dz = -radius; dz <= radius; dz++) {
-    for (let dx = -radius; dx <= radius; dx++) {
-      const rx = x + dx;
-      const ry = y + dz;
-      if (rx < 0 || rx > 255 || ry < 0 || ry > 127) continue;
-      requests.push(loadRegion(rx, ry));
+    const x = parseInt(ui.regionX.value, 10);
+    const y = parseInt(ui.regionY.value, 10);
+    const radius = clamp(parseInt(ui.loadRadius.value, 10) || 0, 0, 2);
+    state.baseX = x;
+    state.baseY = y;
+    for (const region of state.regions.values()) {
+      disposeRegionResources(region);
     }
+    state.regions.clear();
+    state.dirty.clear();
+    state.tileDirty.clear();
+    setStatus(`Loading ${x},${y} radius ${radius}`);
+
+    const requests = [];
+    for (let dz = -radius; dz <= radius; dz++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const rx = x + dx;
+        const ry = y + dz;
+        if (rx < 0 || rx > 255 || ry < 0 || ry > 127) continue;
+        requests.push(loadRegion(rx, ry));
+      }
+    }
+    await Promise.all(requests);
+    rebuildObjects();
+    const centerHeight = heightAtWorld(0, 0)?.height || 0;
+    state.camera.x = 0;
+    state.camera.y = centerHeight + 650;
+    state.camera.z = 2200;
+    state.camera.yaw = Math.PI;
+    state.camera.pitch = -0.35;
+    updateMeta();
+    setStatus("Left paint, right mouse look, WASD fly, Space/Shift vertical, R = sprint, Ctrl+Z = undo");
+  } finally {
+    state.loadingRegion = false;
   }
-  await Promise.all(requests);
-  rebuildObjects();
-  const centerHeight = heightAtWorld(0, 0)?.height || 0;
-  state.camera.x = 0;
-  state.camera.y = centerHeight + 650;
-  state.camera.z = 2200;
-  state.camera.yaw = Math.PI;
-  state.camera.pitch = -0.35;
-  updateMeta();
-  setStatus("Left paint, right mouse look, WASD fly, Space/Shift vertical, R = sprint, Ctrl+Z = undo");
 }
 
 async function loadRegion(x, y, opts = {}) {
@@ -754,6 +842,85 @@ function streamLoadTick() {
         .finally(() => state.streamingInFlight.delete(key));
     }
   }
+  evictDistantRegions(cur, radius);
+}
+
+function evictDistantRegions(center, loadRadius) {
+  const keepRadius = loadRadius + REGION_EVICT_EXTRA_RADIUS;
+  const victims = [];
+  for (const region of state.regions.values()) {
+    const dx = Math.abs(region.x - center.x);
+    const dy = Math.abs(region.y - center.y);
+    const dist = Math.max(dx, dy);
+    if (dist <= keepRadius) continue;
+    if (!canEvictRegion(region)) continue;
+    victims.push({ region, dist });
+  }
+  if (victims.length === 0) return;
+  victims.sort((a, b) => b.dist - a.dist);
+  for (const { region } of victims) {
+    unloadRegion(region.x, region.y, { clearDirty: false });
+    state.perf.evictedRegions++;
+  }
+  updateMeta();
+}
+
+function canEvictRegion(region) {
+  const key = keyFor(region.x, region.y);
+  const regionID = regionIDFor(region.x, region.y);
+  if (state.dirty.has(key) || state.tileDirty.has(key)) return false;
+  if (state.brushStroke?.regionDeltas?.has(key)) return false;
+  if (region.tilePreviewTimer || region.tilePreviewInFlight || region.tilePreviewPending) return false;
+  if (state.hover?.region === region) return false;
+  if (placementIndexInRegion(state.selection?.index, regionID)) return false;
+  if (placementIndexInRegion(state.dragging?.index, regionID)) return false;
+  if (state.editSession && placementIndexInRegion(findPlacementByCid(state.editSession.cid), regionID)) return false;
+  for (const idx of state.dirtyPlacements) {
+    const p = state.objectPlacements[idx];
+    if (placementTouchesRegion(p, regionID)) return false;
+  }
+  for (const p of state.objectPlacements) {
+    if (p.isNew && placementTouchesRegion(p, regionID)) return false;
+  }
+  for (const d of state.pendingDeletes) {
+    if (d.regionID === regionID) return false;
+  }
+  if (undoRedoReferencesRegion(key, regionID)) return false;
+  return true;
+}
+
+function placementIndexInRegion(index, regionID) {
+  if (index == null || index < 0) return false;
+  return placementTouchesRegion(state.objectPlacements[index], regionID);
+}
+
+function placementTouchesRegion(p, regionID) {
+  if (!p) return false;
+  return p.regionID === regionID || p.originalRegionID === regionID;
+}
+
+function undoRedoReferencesRegion(key, regionID) {
+  for (const cmd of state.undoStack) {
+    if (commandReferencesRegion(cmd, key, regionID)) return true;
+  }
+  for (const cmd of state.redoStack) {
+    if (commandReferencesRegion(cmd, key, regionID)) return true;
+  }
+  return false;
+}
+
+function commandReferencesRegion(cmd, key, regionID) {
+  if (!cmd) return false;
+  const hasMetadata = !!(cmd.regionKeys || cmd.regionIDs || cmd.objectCids);
+  if (cmd.regionKeys && cmd.regionKeys.includes(key)) return true;
+  if (cmd.regionIDs && cmd.regionIDs.includes(regionID)) return true;
+  if (cmd.objectCids) {
+    for (const cid of cmd.objectCids) {
+      const idx = findPlacementByCid(cid);
+      if (placementIndexInRegion(idx, regionID)) return true;
+    }
+  }
+  return !hasMetadata;
 }
 
 async function loadRegionNVMCells(region) {
@@ -905,29 +1072,22 @@ async function refreshTilePreview(region) {
   region.tilePreviewPending = false;
   const seq = region.tilePreviewSeq || 0;
   const patch = region.texture && !region.tilePreviewFull ? region.tilePreviewPatch : null;
+  const patchIDs = patch ? textureIDsForPatch(region, patch) : null;
   region.tilePreviewPatch = null;
   region.tilePreviewFull = false;
-  const body = {
-    x: region.x,
-    y: region.y,
-    textureIDs: patch ? textureIDsForPatch(region, patch) : Array.from(region.tileIDs)
-  };
-  if (patch) body.patch = patch;
+  const started = performance.now();
   try {
-    const res = await fetch(`/api/region/texture/preview${patch ? "?raw=1" : ""}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) throw new Error(await res.text());
     if (patch) {
-      const size = parseTextureSizeHeader(res.headers.get("X-Texture-Size"));
-      const bytes = new Uint8Array(await res.arrayBuffer());
-      await applyTilePreviewPatchRaw(region, bytes, seq, patch, size.width, size.height);
-    } else {
-      const blob = await res.blob();
-      await applyTilePreviewBlob(region, blob, seq);
+      try {
+        await refreshTilePreviewClient(region, patch, patchIDs, seq);
+        recordTilePreviewTiming(performance.now() - started, "client");
+        return;
+      } catch (clientErr) {
+        console.warn("client tile preview failed, using server fallback:", clientErr);
+      }
     }
+    await refreshTilePreviewServer(region, patch, patchIDs, seq);
+    recordTilePreviewTiming(performance.now() - started, patch ? "server patch" : "server full");
   } catch (err) {
     console.warn("tile preview refresh failed:", err);
     setStatus(`Tile preview failed: ${err.message}`);
@@ -938,6 +1098,159 @@ async function refreshTilePreview(region) {
       refreshTilePreview(region);
     }
   }
+}
+
+async function refreshTilePreviewServer(region, patch, patchIDs, seq) {
+  const body = {
+    x: region.x,
+    y: region.y,
+    textureIDs: patch ? patchIDs : Array.from(region.tileIDs)
+  };
+  if (patch) body.patch = patch;
+  const res = await fetch(`/api/region/texture/preview${patch ? "?raw=1" : ""}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(await res.text());
+  if (patch) {
+    const size = parseTextureSizeHeader(res.headers.get("X-Texture-Size"));
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    await applyTilePreviewPatchRaw(region, bytes, seq, patch, size.width, size.height);
+  } else {
+    const blob = await res.blob();
+    await applyTilePreviewBlob(region, blob, seq);
+  }
+}
+
+async function refreshTilePreviewClient(region, patch, patchIDs, seq) {
+  if (!tilePreviewCtx) throw new Error("2D canvas is not available");
+  if (!region.texture) throw new Error("region texture is not loaded");
+  const unique = new Set();
+  for (const id of patchIDs) unique.add(id & 0x7FF);
+  const entries = await Promise.all([...unique].map(async id => [id, await loadTilePreviewImage(id)]));
+  const tiles = new Map(entries);
+  const out = composeTilePreviewPatch(patch, patchIDs, tiles);
+  await applyTilePreviewPatchRaw(region, out.bytes, seq, patch, out.width, out.height);
+}
+
+function loadTilePreviewImage(id) {
+  id &= 0x7FF;
+  if (state.tilePreviewCache.has(id)) return state.tilePreviewCache.get(id);
+  const promise = new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const width = img.naturalWidth || img.width;
+        const height = img.naturalHeight || img.height;
+        if (!width || !height || !tilePreviewCtx) {
+          resolve(null);
+          return;
+        }
+        tilePreviewCanvas.width = width;
+        tilePreviewCanvas.height = height;
+        tilePreviewCtx.clearRect(0, 0, width, height);
+        tilePreviewCtx.drawImage(img, 0, 0, width, height);
+        const pixels = tilePreviewCtx.getImageData(0, 0, width, height).data;
+        resolve({ width, height, pixels });
+      } catch (err) {
+        console.warn(`tile ${id} decode failed:`, err);
+        resolve(null);
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = `/api/tile?id=${id}`;
+  });
+  state.tilePreviewCache.set(id, promise);
+  return promise;
+}
+
+function composeTilePreviewPatch(patch, ids, tiles) {
+  const tileW = patch.maxTileX - patch.minTileX + 1;
+  const tileH = patch.maxTileZ - patch.minTileZ + 1;
+  const gridW = tileW + 1;
+  const gridH = tileH + 1;
+  if (ids.length !== gridW * gridH) {
+    throw new Error(`texture patch must contain ${gridW * gridH} values, got ${ids.length}`);
+  }
+  const width = tileW * COMPOSITE_TILE_SIZE;
+  const height = tileH * COMPOSITE_TILE_SIZE;
+  const bytes = new Uint8Array(width * height * 4);
+  const tileSpan = COMPOSITE_TILE_SIZE * TILE_TEXTURE_REPEAT;
+
+  for (let tz = patch.minTileZ; tz <= patch.maxTileZ; tz++) {
+    const lz = tz - patch.minTileZ;
+    for (let tx = patch.minTileX; tx <= patch.maxTileX; tx++) {
+      const lx = tx - patch.minTileX;
+      const i00 = lz * gridW + lx;
+      const i10 = i00 + 1;
+      const i01 = i00 + gridW;
+      const i11 = i01 + 1;
+      const tex00 = tiles.get(ids[i00] & 0x7FF);
+      const tex10 = tiles.get(ids[i10] & 0x7FF);
+      const tex01 = tiles.get(ids[i01] & 0x7FF);
+      const tex11 = tiles.get(ids[i11] & 0x7FF);
+
+      for (let py = 0; py < COMPOSITE_TILE_SIZE; py++) {
+        const blendV = (py + 0.5) / COMPOSITE_TILE_SIZE;
+        const oneBlendV = 1 - blendV;
+        const outY = lz * COMPOSITE_TILE_SIZE + py;
+        const texV = (((tz * COMPOSITE_TILE_SIZE + py) % tileSpan) + 0.5) / tileSpan;
+        for (let px = 0; px < COMPOSITE_TILE_SIZE; px++) {
+          const blendU = (px + 0.5) / COMPOSITE_TILE_SIZE;
+          const oneBlendU = 1 - blendU;
+          const w00 = oneBlendU * oneBlendV;
+          const w10 = blendU * oneBlendV;
+          const w01 = oneBlendU * blendV;
+          const w11 = blendU * blendV;
+          const texU = (((tx * COMPOSITE_TILE_SIZE + px) % tileSpan) + 0.5) / tileSpan;
+          const o00 = tileSampleOffset(tex00, texU, texV);
+          const o10 = tileSampleOffset(tex10, texU, texV);
+          const o01 = tileSampleOffset(tex01, texU, texV);
+          const o11 = tileSampleOffset(tex11, texU, texV);
+          const p00 = tex00?.pixels;
+          const p10 = tex10?.pixels;
+          const p01 = tex01?.pixels;
+          const p11 = tex11?.pixels;
+          const r = sampleChannel(p00, o00, 0) * w00 + sampleChannel(p10, o10, 0) * w10 + sampleChannel(p01, o01, 0) * w01 + sampleChannel(p11, o11, 0) * w11;
+          const g = sampleChannel(p00, o00, 1) * w00 + sampleChannel(p10, o10, 1) * w10 + sampleChannel(p01, o01, 1) * w01 + sampleChannel(p11, o11, 1) * w11;
+          const b = sampleChannel(p00, o00, 2) * w00 + sampleChannel(p10, o10, 2) * w10 + sampleChannel(p01, o01, 2) * w01 + sampleChannel(p11, o11, 2) * w11;
+          const outX = lx * COMPOSITE_TILE_SIZE + px;
+          const off = (outY * width + outX) * 4;
+          bytes[off] = clampPreviewByte(r);
+          bytes[off + 1] = clampPreviewByte(g);
+          bytes[off + 2] = clampPreviewByte(b);
+          bytes[off + 3] = 255;
+        }
+      }
+    }
+  }
+  return { bytes, width, height };
+}
+
+function tileSampleOffset(tile, u, v) {
+  if (!tile) return -1;
+  let x = Math.floor(u * tile.width);
+  let y = Math.floor(v * tile.height);
+  x = clamp(x, 0, tile.width - 1);
+  y = clamp(y, 0, tile.height - 1);
+  return (y * tile.width + x) * 4;
+}
+
+function sampleChannel(pixels, offset, channel) {
+  if (!pixels || offset < 0) return TILE_PREVIEW_FALLBACK_RGBA[channel];
+  return pixels[offset + channel];
+}
+
+function clampPreviewByte(value) {
+  if (value <= 0) return 0;
+  if (value >= 255) return 255;
+  return value;
+}
+
+function recordTilePreviewTiming(ms, source) {
+  state.perf.tilePreviewMs = ms;
+  state.perf.tilePreviewSource = source;
 }
 
 function parseTextureSizeHeader(value) {
@@ -1109,6 +1422,7 @@ function rebuildObjects() {
   for (const region of state.regions.values()) {
     appendRegionPlacements(region, seen);
   }
+  cleanupUnusedObjectAssets();
   rebuildObjectMarkers();
   refreshSaveDirtyState();
   updateSelectionUI();
@@ -1196,11 +1510,14 @@ async function fetchObjectAsset(id) {
   try {
     const data = await fetchJSON(endpoint);
     const meshes = (data.meshes || []).map(buildObjectMesh).filter(Boolean);
+    const renderBounds = objectAssetRenderBounds(data.bboxMin || [0, 0, 0], data.bboxMax || [0, 0, 0]);
     state.objectAssets.set(id, {
       state: meshes.length ? "ready" : "empty",
       meshes,
       bboxMin: data.bboxMin || [0, 0, 0],
       bboxMax: data.bboxMax || [0, 0, 0],
+      renderCenter: renderBounds.center,
+      renderRadius: renderBounds.radius,
       hasCollision: !!data.hasCollision,
       collisionBBoxMin: data.collisionBBoxMin || data.bboxMin || [0, 0, 0],
       collisionBBoxMax: data.collisionBBoxMax || data.bboxMax || [0, 0, 0],
@@ -1228,6 +1545,7 @@ function buildObjectMesh(mesh) {
   if (mesh.textureUrl) {
     const img = new Image();
     img.onload = () => {
+      if (record.disposed) return;
       const tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
@@ -1241,6 +1559,18 @@ function buildObjectMesh(mesh) {
     img.src = mesh.textureUrl;
   }
   return record;
+}
+
+function objectAssetRenderBounds(min, max) {
+  const center = [
+    (min[0] + max[0]) * 0.5,
+    (min[1] + max[1]) * 0.5,
+    (min[2] + max[2]) * 0.5
+  ];
+  const dx = max[0] - center[0];
+  const dy = max[1] - center[1];
+  const dz = max[2] - center[2];
+  return { center, radius: Math.hypot(dx, dy, dz) + OBJECT_CULL_PADDING };
 }
 
 function makeObjectMatrix(wx, wy, wz, yaw, out) {
@@ -1485,6 +1815,8 @@ function endEditSession() {
   const { cid, label, before } = sess;
   pushUndo({
     label,
+    objectCids: [cid],
+    regionIDs: uniqueRegionIDs([state.objectPlacements[idx].regionID, state.objectPlacements[idx].originalRegionID]),
     undo: () => applyPlacementSnap(findPlacementByCid(cid), before),
     redo: () => applyPlacementSnap(findPlacementByCid(cid), after)
   });
@@ -1536,6 +1868,7 @@ function endBrushStroke() {
   if (final.size === 0) return;
   pushUndo({
     label,
+    regionKeys: [...final.keys()],
     undo: () => applyBrushStroke(final, mode, 1),
     redo: () => applyBrushStroke(final, mode, 2)
   });
@@ -1713,6 +2046,11 @@ function setToolMode(mode) {
     state.selection = null;
     updateSelectionUI();
   }
+  // Brush mode always pops the Sculpt dock open so the brush settings are
+  // visible without an extra rail click.
+  if (mode === "brush" && window.SromapPanels) {
+    window.SromapPanels.showPanel("sculptPanel");
+  }
 }
 
 function setupObjectPanelDrag() {
@@ -1847,6 +2185,14 @@ function hasUnsavedObjectChanges() {
   return false;
 }
 
+function hasUnsavedTerrainChanges() {
+  return state.dirty.size > 0 || state.tileDirty.size > 0;
+}
+
+function hasAnyUnsavedChanges() {
+  return hasUnsavedTerrainChanges() || hasUnsavedObjectChanges();
+}
+
 function refreshSaveDirtyState() {
   const dirty = hasUnsavedObjectChanges();
   if (ui.objectSaveStatus) {
@@ -1862,14 +2208,18 @@ function refreshSaveDirtyState() {
 function refreshSaveAllButton() {
   if (!ui.saveAllBtn) return;
   if (state.saveJustFlashed) return; // flashSavedJustNow is in control of the label
-  const regions = state.dirty.size;
+  const regions = new Set([...state.dirty, ...state.tileDirty]).size;
   const objEdits = state.dirtyPlacements.size;
   const objDeletes = state.pendingDeletes.length;
   const objAdds = state.objectPlacements.filter(p => p.isNew).length;
   const objTotal = objEdits + objDeletes + objAdds;
-  const anyDirty = regions > 0 || objTotal > 0;
+  const anyDirty = hasAnyUnsavedChanges();
   ui.saveAllBtn.classList.toggle("dirty", anyDirty);
   ui.saveAllBtn.disabled = !anyDirty || state.saving === true;
+  if (state.saving) {
+    ui.saveAllBtn.textContent = "Saving...";
+    return;
+  }
   if (!anyDirty) {
     ui.saveAllBtn.textContent = "Saved";
     return;
@@ -1877,6 +2227,8 @@ function refreshSaveAllButton() {
   const parts = [];
   if (regions > 0) parts.push(`${regions} region${regions === 1 ? "" : "s"}`);
   if (objTotal > 0) parts.push(`${objTotal} object${objTotal === 1 ? "" : "s"}`);
+  ui.saveAllBtn.textContent = `Save - ${parts.join(" - ")}`;
+  return;
   ui.saveAllBtn.textContent = `Save + NVM · ${parts.join(" · ")}`;
 }
 
@@ -1900,7 +2252,16 @@ function flashSavedJustNow(label) {
 }
 
 async function saveAll(opts = {}) {
-  if (state.saving) return;
+  if (state.saving) {
+    if (!opts.silent) setStatus("Save already in progress");
+    return false;
+  }
+  flushInProgressEdits();
+  if (!hasAnyUnsavedChanges()) {
+    if (!opts.silent) setStatus("All changes saved");
+    refreshSaveAllButton();
+    return true;
+  }
   state.saving = true;
   refreshSaveAllButton();
   const rebuildTargets = new Map();
@@ -1911,21 +2272,24 @@ async function saveAll(opts = {}) {
     if (hasUnsavedObjectChanges()) {
       addRegionTargets(rebuildTargets, await saveObjectEdits({ silent: true }));
     }
-    if (state.dirty.size > 0) {
+    if (hasUnsavedTerrainChanges()) {
       addRegionTargets(rebuildTargets, await saveDirtyRegions({ silent: true }));
     }
     if (opts.rebuildNVM !== false && rebuildTargets.size > 0) {
-      const regions = expandNVMRebuildTargets([...rebuildTargets.values()], { radius: 0 });
+      const regions = expandNVMRebuildTargets([...rebuildTargets.values()], { radius: opts.nvmRadius ?? 1 });
       const result = await rebuildMapOnlyNVMs(regions, {
         createMissing: true,
-        statusPrefix: "Save NVM"
+        statusPrefix: "Save"
       });
-      setStatus(`Saved and rebuilt ${result.done} NVM(s)`);
-    } else {
+      if (!opts.silent) setStatus(`All changes saved (${result.done} navmesh file(s) updated)`);
+    } else if (!opts.silent) {
       setStatus("All changes saved");
     }
+    return true;
   } catch (err) {
     setStatus(`Save/rebuild failed: ${err.message}`);
+    if (opts.throwOnError) throw err;
+    return false;
   } finally {
     state.saving = false;
     refreshSaveAllButton();
@@ -1942,6 +2306,19 @@ function addRegionTargets(targets, regions) {
 
 function regionFromID(regionID) {
   return { x: regionID & 0xff, y: (regionID >> 8) & 0xff };
+}
+
+function regionIDFor(x, y) {
+  return (y << 8) | x;
+}
+
+function uniqueRegionIDs(values) {
+  const out = [];
+  for (const value of values) {
+    if (value == null) continue;
+    if (!out.includes(value)) out.push(value);
+  }
+  return out;
 }
 
 function expandNVMRebuildTargets(regions, opts = {}) {
@@ -2088,6 +2465,8 @@ function deleteSelectedObject() {
   refreshSaveDirtyState();
   pushUndo({
     label: snapshot.isNew ? "Delete (spawned)" : "Delete object",
+    objectCids: [snapshot._cid],
+    regionIDs: uniqueRegionIDs([snapshot.regionID, snapshot.originalRegionID]),
     undo: () => {
       state.objectPlacements.splice(insertAt, 0, { ...snapshot });
       if (!snapshot.isNew) {
@@ -2357,6 +2736,8 @@ function spawnObjectAtHover(entry) {
   const snapshot = JSON.parse(JSON.stringify(placement));
   pushUndo({
     label: `Spawn ${entry.path}`,
+    objectCids: [snapshot._cid],
+    regionIDs: [snapshot.regionID],
     undo: () => {
       const i = findPlacementByCid(snapshot._cid);
       if (i < 0) return;
@@ -2379,7 +2760,7 @@ async function restoreLoadedRegionNVMs() {
     setStatus("Load a region first");
     return;
   }
-  ui.restoreNVMBtn.disabled = true;
+  if (ui.restoreNVMBtn) ui.restoreNVMBtn.disabled = true;
   ui.bakeStatus.textContent = `Restoring NVM for ${regions.length} region(s)...`;
   try {
     let restored = 0, skipped = 0;
@@ -2398,37 +2779,36 @@ async function restoreLoadedRegionNVMs() {
     ui.bakeStatus.textContent = `Restore failed: ${err.message}`;
     setStatus(`Restore failed: ${err.message}`);
   } finally {
-    ui.restoreNVMBtn.disabled = false;
+    if (ui.restoreNVMBtn) ui.restoreNVMBtn.disabled = false;
   }
 }
 
 async function rebuildLoadedRegionNVMs() {
+  flushInProgressEdits();
   const regions = [...state.regions.values()];
   if (regions.length === 0) {
     setStatus("Load a region first");
     return;
   }
-  if (state.dirty.size > 0) {
-    ui.bakeStatus.textContent = "Saving terrain edits...";
-    await saveDirtyRegions({ silent: true });
-  }
-  if (hasUnsavedCustomPlacements()) {
-    ui.bakeStatus.textContent = "Saving custom object edits...";
-    await saveCustomPlacements({ silent: true });
-  }
-  if (typeof hasUnsavedObjectChanges === "function" && hasUnsavedObjectChanges()) {
-    ui.bakeStatus.textContent = "Saving object edits...";
-    await saveObjectEdits({ silent: true });
+  if (hasAnyUnsavedChanges()) {
+    ui.bakeStatus.textContent = "Saving edits before NVM rebuild...";
+    try {
+      const ok = await saveAll({ rebuildNVM: false, silent: true, throwOnError: true });
+      if (!ok) return;
+    } catch (err) {
+      ui.bakeStatus.textContent = `Save failed: ${err.message}`;
+      return;
+    }
   }
   await rebuildMapOnlyNVMs(regions, {
-    createMissing: !!ui.nvmCreateMissing?.checked,
+    createMissing: ui.nvmCreateMissing ? !!ui.nvmCreateMissing.checked : true,
     statusPrefix: "Manual NVM"
   });
 }
 
 async function rebuildMapOnlyNVMs(regions, opts = {}) {
-  const parsedSlope = parseFloat(ui.nvmSlope.value);
-  const slope = Number.isFinite(parsedSlope) ? parsedSlope : 60;
+  const parsedSlope = parseFloat(ui.nvmSlope?.value ?? DEFAULT_NVM_SLOPE);
+  const slope = Number.isFinite(parsedSlope) ? parsedSlope : DEFAULT_NVM_SLOPE;
   if (ui.rebuildNVMBtn) ui.rebuildNVMBtn.disabled = true;
   ui.bakeStatus.textContent = `Rebuilding NVM for ${regions.length} region(s)...`;
   const startedAt = performance.now();
@@ -2507,23 +2887,22 @@ async function restoreLoadedRegionLightmaps() {
 }
 
 async function bakeLoadedRegionShadows() {
+  flushInProgressEdits();
   const regions = [...state.regions.values()];
   if (regions.length === 0) {
     setStatus("Load a region first");
     return;
   }
   // Bake reads .m and .o2 from disk, so flush any pending edits first.
-  if (state.dirty.size > 0) {
-    ui.bakeStatus.textContent = "Saving terrain edits...";
-    await saveDirtyRegions();
-  }
-  if (hasUnsavedCustomPlacements()) {
-    ui.bakeStatus.textContent = "Saving custom object edits...";
-    await saveCustomPlacements();
-  }
-  if (typeof hasUnsavedObjectChanges === "function" && hasUnsavedObjectChanges()) {
-    ui.bakeStatus.textContent = "Saving object edits...";
-    await saveObjectEdits();
+  if (hasAnyUnsavedChanges()) {
+    ui.bakeStatus.textContent = "Saving edits before shadow bake...";
+    try {
+      const ok = await saveAll({ rebuildNVM: false, silent: true, throwOnError: true });
+      if (!ok) return;
+    } catch (err) {
+      ui.bakeStatus.textContent = `Save failed: ${err.message}`;
+      return;
+    }
   }
   const az = parseFloat(ui.bakeAzimuth.value);
   const el = parseFloat(ui.bakeElevation.value);
@@ -2708,6 +3087,7 @@ function drawSelectionBox(viewProj) {
 }
 
 function frame(now) {
+  const frameStarted = performance.now();
   const dt = Math.min(0.05, (now - state.lastFrame) / 1000);
   state.lastFrame = now;
   resize();
@@ -2718,7 +3098,56 @@ function frame(now) {
   if (state.toolMode === "brush" && state.leftDown) stampBrush(false);
   draw();
   drawWorldMap();
+  state.perf.frameMs = performance.now() - frameStarted;
+  updatePerfStats(now);
   requestAnimationFrame(frame);
+}
+
+function updatePerfStats(now) {
+  const perf = state.perf;
+  perf.fpsFrames++;
+  const fpsWindow = now - perf.fpsLastAt;
+  if (fpsWindow >= 500) {
+    perf.fps = perf.fpsFrames * 1000 / fpsWindow;
+    perf.fpsFrames = 0;
+    perf.fpsLastAt = now;
+  }
+  if (now - perf.lastUIAt < 250) return;
+  perf.lastUIAt = now;
+  updatePerfPanel();
+}
+
+function updatePerfPanel() {
+  if (!ui.perfFPS) return;
+  const perf = state.perf;
+  const inFlight = state.streamingInFlight.size;
+  ui.perfFPS.textContent = perf.fps ? perf.fps.toFixed(0) : "-";
+  ui.perfFrameMs.textContent = `${perf.frameMs.toFixed(1)} ms`;
+  ui.perfRegions.textContent = inFlight ? `${state.regions.size} + ${inFlight}` : String(state.regions.size);
+  if (ui.perfEvictedRegions) ui.perfEvictedRegions.textContent = String(perf.evictedRegions);
+  ui.perfObjects.textContent = `${perf.objectDrawn}/${state.objectPlacements.length}`;
+  ui.perfCulledObjects.textContent = String(perf.objectCulled);
+  ui.perfDrawCalls.textContent = String(perf.terrainDrawCalls + perf.objectDrawCalls);
+  ui.perfTilePreview.textContent = perf.tilePreviewMs > 0
+    ? `${perf.tilePreviewMs.toFixed(1)} ms ${perf.tilePreviewSource}`
+    : "-";
+  ui.perfTextures.textContent = String(estimateLoadedGPUTextures());
+}
+
+function estimateLoadedGPUTextures() {
+  const textures = new Set();
+  if (whitePixelTexture) textures.add(whitePixelTexture);
+  for (const region of state.regions.values()) {
+    if (region.texture) textures.add(region.texture);
+    if (region.lightmap) textures.add(region.lightmap);
+  }
+  for (const asset of state.objectAssets.values()) {
+    if (!asset || asset.state !== "ready" || !asset.meshes) continue;
+    for (const mesh of asset.meshes) {
+      if (mesh.texture) textures.add(mesh.texture);
+    }
+  }
+  return textures.size;
 }
 
 function updateCamera(dt) {
@@ -2898,13 +3327,14 @@ function stampTileBrush(radius) {
 }
 
 async function saveDirtyRegions(opts = {}) {
-  const keys = [...state.dirty];
+  const keys = [...new Set([...state.dirty, ...state.tileDirty])];
   if (keys.length === 0) {
     if (!opts.silent) setStatus("No dirty regions to save");
     return [];
   }
   try {
     let saved = 0;
+    let savedTiles = false;
     const affected = [];
     for (const key of keys) {
       const region = state.regions.get(key);
@@ -2926,6 +3356,7 @@ async function saveDirtyRegions(opts = {}) {
       state.dirty.delete(key);
       if (includeTiles) {
         state.tileDirty.delete(key);
+        savedTiles = true;
         region.textureURL = `/api/region/texture?x=${region.x}&y=${region.y}&v=${Date.now()}`;
         loadRegionTexture(region);
       }
@@ -2933,6 +3364,7 @@ async function saveDirtyRegions(opts = {}) {
       if (!opts.silent) setStatus(`Saved ${saved}/${keys.length}`);
       updateMeta();
     }
+    if (savedTiles) loadWorldMapTexture(true);
     if (!opts.silent) setStatus(`Saved ${saved} region(s)`);
     return affected;
   } catch (err) {
@@ -2943,6 +3375,10 @@ async function saveDirtyRegions(opts = {}) {
 
 function draw() {
   const viewProj = viewProjectionMatrix();
+  state.perf.terrainDrawCalls = 0;
+  state.perf.objectDrawn = 0;
+  state.perf.objectCulled = 0;
+  state.perf.objectDrawCalls = 0;
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -2965,6 +3401,7 @@ function draw() {
     const lmStrength = region.lightmap ? state.lightmapStrength : 0.0;
     gl.uniform1f(terrainProgram.uniforms.uLightmapStrength, lmStrength);
     gl.drawElements(gl.TRIANGLES, terrainIndexCount, gl.UNSIGNED_SHORT, 0);
+    state.perf.terrainDrawCalls++;
   }
 
   drawObjectMeshes(viewProj);
@@ -3237,34 +3674,63 @@ function pushLine(out, a, b) {
 
 function drawObjectMeshes(viewProj) {
   if (state.objectPlacements.length === 0) return;
+  const planes = extractFrustumPlanes(viewProj, objectFrustumPlanes);
+  const selectedPlacement = state.selection ? state.objectPlacements[state.selection.index] : null;
   gl.useProgram(objectProgram.program);
   gl.uniform1i(objectProgram.uniforms.uTexture, 0);
+  gl.uniform3fv(objectProgram.uniforms.uTint, objectTint);
   gl.activeTexture(gl.TEXTURE0);
-  const mvp = new Float32Array(16);
-  const tmp = new Float32Array(16);
+  let lastMesh = null;
+  let lastTexture = null;
+  let lastHasTexture = -1;
   for (const placement of state.objectPlacements) {
     const asset = state.objectAssets.get(placement.objID);
     if (!asset || asset.state !== "ready" || !asset.meshes) continue;
-    const model = makeObjectMatrix(placement.wx, placement.wy, placement.wz, placement.yaw, tmp);
-    mat4Multiply(viewProj, model, mvp);
-    gl.uniformMatrix4fv(objectProgram.uniforms.uMVP, false, mvp);
-    gl.uniform3fv(objectProgram.uniforms.uTint, [0.7, 0.65, 0.55]);
+    if (placement !== selectedPlacement && !placementInFrustum(placement, asset, planes)) {
+      state.perf.objectCulled++;
+      continue;
+    }
+    state.perf.objectDrawn++;
+    const model = makeObjectMatrix(placement.wx, placement.wy, placement.wz, placement.yaw, objectModelMatrix);
+    mat4Multiply(viewProj, model, objectMVPMatrix);
+    gl.uniformMatrix4fv(objectProgram.uniforms.uMVP, false, objectMVPMatrix);
     for (const mesh of asset.meshes) {
-      bindAttributeStride(objectProgram.attributes.aPosition, mesh.vbuf, 3, 5 * 4, 0);
-      if (objectProgram.attributes.aTexCoord !== undefined) {
-        bindAttributeStride(objectProgram.attributes.aTexCoord, mesh.vbuf, 2, 5 * 4, 3 * 4);
+      if (mesh !== lastMesh) {
+        bindAttributeStride(objectProgram.attributes.aPosition, mesh.vbuf, 3, 5 * 4, 0);
+        if (objectProgram.attributes.aTexCoord !== undefined) {
+          bindAttributeStride(objectProgram.attributes.aTexCoord, mesh.vbuf, 2, 5 * 4, 3 * 4);
+        }
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibuf);
+        lastMesh = mesh;
       }
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibuf);
-      if (mesh.texture) {
-        gl.bindTexture(gl.TEXTURE_2D, mesh.texture);
-        gl.uniform1f(objectProgram.uniforms.uHasTexture, 1.0);
-      } else {
-        gl.bindTexture(gl.TEXTURE_2D, whitePixelTexture);
-        gl.uniform1f(objectProgram.uniforms.uHasTexture, 0.0);
+      const texture = mesh.texture || whitePixelTexture;
+      if (texture !== lastTexture) {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        lastTexture = texture;
+      }
+      const hasTexture = mesh.texture ? 1.0 : 0.0;
+      if (hasTexture !== lastHasTexture) {
+        gl.uniform1f(objectProgram.uniforms.uHasTexture, hasTexture);
+        lastHasTexture = hasTexture;
       }
       gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+      state.perf.objectDrawCalls++;
     }
   }
+}
+
+function placementInFrustum(placement, asset, planes) {
+  const center = asset.renderCenter || [0, 0, 0];
+  const radius = asset.renderRadius || OBJECT_CULL_PADDING;
+  const c = Math.cos(placement.yaw || 0);
+  const s = Math.sin(placement.yaw || 0);
+  const x = -c * center[0] + s * center[2] + placement.wx;
+  const y = center[1] + placement.wy;
+  const z = s * center[0] + c * center[2] + placement.wz;
+  for (const p of planes) {
+    if (p[0] * x + p[1] * y + p[2] * z + p[3] < -radius) return false;
+  }
+  return true;
 }
 
 // ---------- World Map (M key) ----------
@@ -3272,12 +3738,33 @@ function drawObjectMeshes(viewProj) {
 const WORLD_MAP_W = 256;     // region grid: 256 X, 128 Y
 const WORLD_MAP_H = 128;
 const WORLD_MAP_PX = 4;      // pixels per region in the backing canvas
+const WORLD_MAP_TEXTURE_SCALE = 8;
 
 function toggleWorldMap(force) {
   const next = typeof force === "boolean" ? force : !state.worldMapOpen;
   state.worldMapOpen = next;
   ui.worldMap.hidden = !next;
-  if (next) renderWorldMap();
+  if (next) {
+    loadWorldMapTexture();
+    renderWorldMap();
+  }
+}
+
+function loadWorldMapTexture(force = false) {
+  if (state.worldMapTextureLoading) return;
+  if (state.worldMapTextureImage && !force) return;
+  state.worldMapTextureLoading = true;
+  const img = new Image();
+  img.onload = () => {
+    state.worldMapTextureImage = img;
+    state.worldMapTextureLoading = false;
+    if (state.worldMapOpen) renderWorldMap();
+  };
+  img.onerror = () => {
+    state.worldMapTextureLoading = false;
+    if (force) state.worldMapTextureImage = null;
+  };
+  img.src = `/api/worldmap/texture?scale=${WORLD_MAP_TEXTURE_SCALE}&v=${Date.now()}`;
 }
 
 function renderWorldMap() {
@@ -3294,10 +3781,25 @@ function renderWorldMap() {
   ctx.setTransform(state.worldMapZoom, 0, 0, state.worldMapZoom,
     state.worldMapPanX, state.worldMapPanY);
 
+  const hasTexture = !!(state.worldMapTextureImage && state.worldMapTextureImage.complete && state.worldMapTextureImage.naturalWidth > 0);
+  if (hasTexture) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(
+      state.worldMapTextureImage,
+      0,
+      0,
+      WORLD_MAP_W * WORLD_MAP_PX,
+      WORLD_MAP_H * WORLD_MAP_PX
+    );
+    ctx.imageSmoothingEnabled = false;
+  }
+
   if (state.info?.regions) {
     for (const r of state.info.regions) {
       if (r.isDungeon) continue;
-      const color = r.hasRef ? "#c9a149" : "#3f6e3f";
+      const color = hasTexture
+        ? (r.hasRef ? "rgba(230, 190, 86, 0.32)" : "rgba(71, 124, 70, 0.16)")
+        : (r.hasRef ? "#c9a149" : "#3f6e3f");
       ctx.fillStyle = color;
       ctx.fillRect(r.x * WORLD_MAP_PX, (WORLD_MAP_H - 1 - r.y) * WORLD_MAP_PX, WORLD_MAP_PX, WORLD_MAP_PX);
     }
@@ -3587,6 +4089,7 @@ async function onPasteRegionDialogClose() {
       const info = await fetchJSON("/api/info");
       state.info = info;
     } catch (_) {}
+    loadWorldMapTexture(true);
     state.worldMapClipboard = null;
     refreshWorldMapActions();
   } catch (err) {
@@ -3754,6 +4257,7 @@ async function onDeleteRegionDialogClose() {
       const info = await fetchJSON("/api/info");
       state.info = info;
     } catch (_) {}
+    loadWorldMapTexture(true);
     state.worldMapSelection = null;
     refreshWorldMapActions();
     updateMeta();
@@ -3763,33 +4267,112 @@ async function onDeleteRegionDialogClose() {
 }
 
 // unloadRegion drops a region's GPU buffers and placements from the live
-// scene without touching disk. Used after server-side delete confirms a
-// region is gone, and could be reused for memory eviction later.
-function unloadRegion(x, y) {
+// scene without touching disk. Server-side delete calls clear dirty state;
+// streaming eviction passes clearDirty:false after canEvictRegion proves the
+// region has no pending edits.
+function unloadRegion(x, y, opts = {}) {
   const key = keyFor(x, y);
   const region = state.regions.get(key);
   if (region) {
-    if (region.texture) gl.deleteTexture(region.texture);
-    if (region.lightmap) gl.deleteTexture(region.lightmap);
-    if (region.mesh) {
-      gl.deleteBuffer(region.mesh.position);
-      gl.deleteBuffer(region.mesh.color);
-      if (region.mesh.normal) gl.deleteBuffer(region.mesh.normal);
-      if (region.mesh.texCoord) gl.deleteBuffer(region.mesh.texCoord);
-    }
-    if (region.nvmOpenBuffer) gl.deleteBuffer(region.nvmOpenBuffer);
-    if (region.nvmClosedBuffer) gl.deleteBuffer(region.nvmClosedBuffer);
+    disposeRegionResources(region);
     state.regions.delete(key);
   }
-  state.dirty.delete(key);
-  state.tileDirty.delete(key);
-  const regionID = (y << 8) | x;
-  const before = state.objectPlacements.length;
-  state.objectPlacements = state.objectPlacements.filter(p => p.regionID !== regionID);
-  if (state.objectPlacements.length !== before) {
-    state.selection = null;
-    rebuildObjectMarkers();
-    updateSelectionUI();
+  if (opts.clearDirty !== false) {
+    state.dirty.delete(key);
+    state.tileDirty.delete(key);
+  }
+  if (removePlacementsForRegion(regionIDFor(x, y))) {
+    cleanupUnusedObjectAssets();
+  }
+}
+
+function disposeRegionResources(region) {
+  if (region.tilePreviewTimer) {
+    clearTimeout(region.tilePreviewTimer);
+    region.tilePreviewTimer = 0;
+  }
+  if (region.texture) gl.deleteTexture(region.texture);
+  if (region.lightmap) gl.deleteTexture(region.lightmap);
+  if (region.mesh) {
+    gl.deleteBuffer(region.mesh.position);
+    gl.deleteBuffer(region.mesh.color);
+    if (region.mesh.normal) gl.deleteBuffer(region.mesh.normal);
+    if (region.mesh.texCoord) gl.deleteBuffer(region.mesh.texCoord);
+  }
+  if (region.nvmOpenBuffer) gl.deleteBuffer(region.nvmOpenBuffer);
+  if (region.nvmClosedBuffer) gl.deleteBuffer(region.nvmClosedBuffer);
+}
+
+function removePlacementsForRegion(regionID) {
+  const indexMap = new Map();
+  const next = [];
+  let changed = false;
+  for (let i = 0; i < state.objectPlacements.length; i++) {
+    const p = state.objectPlacements[i];
+    if (p.regionID === regionID) {
+      changed = true;
+      continue;
+    }
+    indexMap.set(i, next.length);
+    next.push(p);
+  }
+  if (!changed) return false;
+  state.objectPlacements = next;
+  reindexPlacementState(indexMap);
+  rebuildObjectMarkers();
+  updateSelectionUI();
+  refreshSaveDirtyState();
+  return true;
+}
+
+function reindexPlacementState(indexMap) {
+  const nextDirty = new Set();
+  for (const idx of state.dirtyPlacements) {
+    if (indexMap.has(idx)) nextDirty.add(indexMap.get(idx));
+  }
+  state.dirtyPlacements = nextDirty;
+  if (state.selection) {
+    const mapped = indexMap.get(state.selection.index);
+    state.selection = mapped == null ? null : { index: mapped };
+  }
+  if (state.dragging) {
+    const mapped = indexMap.get(state.dragging.index);
+    if (mapped == null) {
+      state.dragging = null;
+    } else {
+      state.dragging.index = mapped;
+    }
+  }
+  if (state.editSession && findPlacementByCid(state.editSession.cid) < 0) {
+    state.editSession = null;
+  }
+}
+
+function cleanupUnusedObjectAssets() {
+  const usedIDs = new Set(state.objectPlacements.map(p => p.objID));
+  const usedAssets = new Set();
+  for (const id of usedIDs) {
+    const asset = state.objectAssets.get(id);
+    if (asset) usedAssets.add(asset);
+  }
+  const disposed = new Set();
+  for (const [id, asset] of state.objectAssets) {
+    if (usedIDs.has(id)) continue;
+    if (asset?.state === "loading") continue;
+    state.objectAssets.delete(id);
+    if (!asset || usedAssets.has(asset) || disposed.has(asset)) continue;
+    disposeObjectAsset(asset);
+    disposed.add(asset);
+  }
+}
+
+function disposeObjectAsset(asset) {
+  if (!asset.meshes) return;
+  for (const mesh of asset.meshes) {
+    mesh.disposed = true;
+    if (mesh.vbuf) gl.deleteBuffer(mesh.vbuf);
+    if (mesh.ibuf) gl.deleteBuffer(mesh.ibuf);
+    if (mesh.texture) gl.deleteTexture(mesh.texture);
   }
 }
 
@@ -3817,6 +4400,7 @@ async function onCreateRegionDialogClose() {
       const info = await fetchJSON("/api/info");
       state.info = info;
     } catch (_) {}
+    loadWorldMapTexture(true);
     state.worldMapSelection = null;
     refreshWorldMapActions();
   } catch (err) {
@@ -4068,6 +4652,7 @@ function tileEntryByID(id) {
 
 function updateActiveTileStatus(entry, label) {
   const id = state.activeTileID;
+  if (id !== null && id !== undefined) loadTilePreviewImage(id);
   if (entry) {
     ui.tileStatus.textContent = `${label}: ${entry.id} - ${entry.folder}/${entry.filename}`;
   } else {
@@ -4259,6 +4844,24 @@ function cross(a, b) {
 
 function dot(a, b) {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function extractFrustumPlanes(m, planes) {
+  setFrustumPlane(planes[0], m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]); // left
+  setFrustumPlane(planes[1], m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]); // right
+  setFrustumPlane(planes[2], m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]); // bottom
+  setFrustumPlane(planes[3], m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]); // top
+  setFrustumPlane(planes[4], m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]); // near
+  setFrustumPlane(planes[5], m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]); // far
+  return planes;
+}
+
+function setFrustumPlane(out, a, b, c, d) {
+  const invLen = 1 / (Math.hypot(a, b, c) || 1);
+  out[0] = a * invLen;
+  out[1] = b * invLen;
+  out[2] = c * invLen;
+  out[3] = d * invLen;
 }
 
 function mat4Perspective(fovy, aspect, near, far) {
