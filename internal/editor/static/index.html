@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SRO Map Editor</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <div id="worldMap" hidden>
+    <header>
+      <h2>World Map</h2>
+      <span id="worldMapCoords">-</span>
+      <button id="worldMapMode" data-mode="navigate" title="Toggle between teleport and region-edit mode">Mode: Teleport</button>
+      <button id="worldMapClose" title="Close (M / Esc)">×</button>
+    </header>
+    <canvas id="worldMapCanvas"></canvas>
+    <div id="worldMapActions" hidden>
+      <span id="worldMapSelInfo">-</span>
+      <button id="worldMapCopyBtn">Copy</button>
+      <button id="worldMapCreateBtn">Create…</button>
+      <button id="worldMapDeleteBtn" class="danger">Delete…</button>
+      <button id="worldMapClearSelBtn">Clear</button>
+    </div>
+    <div id="worldMapPasteBar" hidden>
+      <span id="worldMapPasteInfo">-</span>
+      <button id="worldMapCancelPasteBtn">Cancel (Esc)</button>
+    </div>
+    <p class="hint" id="worldMapHint">Click any tile to teleport. Green = active · Yellow = has ref · Orange outline = loaded · Red dot = current position.</p>
+  </div>
+
+  <dialog id="createRegionDialog">
+    <form method="dialog">
+      <h3>Create flat regions</h3>
+      <p class="hint" id="createRegionSummary">-</p>
+      <label>Target Y height
+        <input type="number" id="createRegionHeight" value="100" step="10">
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button value="confirm" id="createRegionConfirm" class="primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="deleteRegionDialog">
+    <form method="dialog">
+      <h3>Delete regions</h3>
+      <p class="hint" id="deleteRegionSummary">-</p>
+      <p class="hint">Removes the .m, .o2 and .nvm files for each region and clears the mapinfo bit. Existing .bak files are kept.</p>
+      <div class="dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button value="confirm" id="deleteRegionConfirm" class="danger">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="importCustomObjectDialog">
+    <form method="dialog">
+      <h3>Import OBJ folder</h3>
+      <p class="hint">Point at a folder containing a <code>base.obj</code> and (optionally) a <code>texture_diffuse.png</code>. Meshy.ai's default output layout works out of the box.</p>
+      <label>Folder path
+        <input type="text" id="importCustomFolder" placeholder="D:\\ExportedPK2\\test_new_obj" autocomplete="off" autofocus>
+      </label>
+      <label>Display name <small>(optional)</small>
+        <input type="text" id="importCustomName" placeholder="Defaults to folder name" autocomplete="off">
+      </label>
+      <label>Target size <small>(world units, longest axis)</small>
+        <input type="number" id="importCustomSize" value="300" min="1" max="5000" step="10">
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button value="confirm" class="primary">Import</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="pasteRegionDialog">
+    <form method="dialog">
+      <h3>Paste copied regions</h3>
+      <p class="hint" id="pasteRegionSummary">-</p>
+      <label>Target floor Y
+        <input type="number" id="pasteRegionFloor" placeholder="leave blank to keep">
+      </label>
+      <label>Rotation
+        <select id="pasteRegionRotation">
+          <option value="0">0°</option>
+          <option value="90">90° CW</option>
+          <option value="180">180°</option>
+          <option value="270">270° CW (= 90° CCW)</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="pasteRegionFlipX"> Flip X (mirror east ↔ west)</label>
+      <label class="check"><input type="checkbox" id="pasteRegionFlipZ"> Flip Z (mirror north ↔ south)</label>
+      <p class="hint">Rotation is applied first, then flips. The bundle's bounding box also rotates — a 3×2 paste becomes 2×3 at 90°/270°.</p>
+      <p class="hint">If a target floor Y is set, the bundle's lowest point lifts to that Y; everything (terrain, objects, NVM heights) shifts by the same delta — relative geometry is preserved.</p>
+      <div class="dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button value="confirm" id="pasteRegionConfirm" class="primary">Paste</button>
+      </div>
+    </form>
+  </dialog>
+
+  <aside id="objectPanel" hidden>
+    <header id="objectPanelHeader">
+      <h2>Object</h2>
+      <span class="drag-hint">drag to move</span>
+    </header>
+    <div class="object-panel-body">
+      <div id="selectInfo">
+        <div class="obj-name" id="selObjName">None</div>
+        <div class="hint" id="selObjMeta">-</div>
+      </div>
+      <fieldset id="objectEdit" disabled>
+        <div class="slider-row">
+          <label for="objXInput">X</label>
+          <input type="range" id="objXSlider" min="0" max="1920" step="0.5">
+          <input type="number" id="objXInput" step="1">
+        </div>
+        <div class="slider-row">
+          <label for="objYInput">Y</label>
+          <input type="range" id="objYSlider" min="-300" max="1500" step="0.5">
+          <input type="number" id="objYInput" step="1">
+        </div>
+        <div class="slider-row">
+          <label for="objZInput">Z</label>
+          <input type="range" id="objZSlider" min="0" max="1920" step="0.5">
+          <input type="number" id="objZInput" step="1">
+        </div>
+        <div class="slider-row">
+          <label for="objYawInput">Yaw</label>
+          <input type="range" id="objYawSlider" min="-180" max="180" step="0.5">
+          <input type="number" id="objYawInput" step="1">
+        </div>
+        <div class="rot-buttons">
+          <button type="button" data-rot="-90">−90°</button>
+          <button type="button" data-rot="-45">−45°</button>
+          <button type="button" data-rot="45">+45°</button>
+          <button type="button" data-rot="90">+90°</button>
+          <button type="button" data-rot="180">180°</button>
+        </div>
+      </fieldset>
+      <button id="snapToTerrainBtn">Snap to terrain</button>
+      <button id="resetObjectBtn">Reset to original</button>
+      <button id="deleteObjectBtn">Delete (Del key)</button>
+      <label class="check object-overlay-toggle"><input id="showObjectCollision" type="checkbox"> Show collision footprints</label>
+      <hr class="divider">
+      <details id="spawnSection">
+        <summary>Spawn new object</summary>
+        <p class="hint">Aim cursor at terrain, then click an entry to spawn at the cursor.</p>
+        <button id="importCustomObjectBtn" type="button" title="Import a folder containing a base.obj + texture_diffuse.png (meshy.ai layout)">Import OBJ folder…</button>
+        <input type="search" id="spawnFilter" placeholder="Search by path or id" autocomplete="off">
+        <div id="spawnList" class="spawn-list"></div>
+        <div id="spawnStatus" class="hint"></div>
+      </details>
+      <div id="objectSaveStatus" class="hint"></div>
+    </div>
+  </aside>
+
+  <aside id="panel">
+    <header>
+      <h1>SRO Map Editor</h1>
+      <button id="saveAllBtn" class="save-all" disabled>Saved</button>
+      <div id="status">Starting</div>
+    </header>
+
+    <section>
+      <label>Region X <input id="regionX" type="number" min="0" max="255" step="1"></label>
+      <label>Region Y <input id="regionY" type="number" min="0" max="127" step="1"></label>
+      <label>Load Radius <input id="loadRadius" type="number" min="0" max="4" step="1" value="1"></label>
+      <button id="loadBtn">Load Region (recenter)</button>
+      <label class="check" title="Auto-load regions in radius as the camera flies over them. Press M for the full world map.">
+        <input id="streamingToggle" type="checkbox" checked> Stream regions
+      </label>
+      <label>Sun shadow <input id="lightmapStrength" type="range" min="0" max="1" step="0.05" value="0.6"></label>
+      <output id="lightmapStrengthOut">0.6</output>
+      <details id="bakeSettings">
+        <summary>Bake settings</summary>
+        <label>Azimuth <input id="bakeAzimuth" type="range" min="0" max="359" step="1" value="75"></label>
+        <output id="bakeAzimuthOut">75</output>
+        <label>Elevation <input id="bakeElevation" type="range" min="10" max="89" step="1" value="40"></label>
+        <output id="bakeElevationOut">40</output>
+        <label>Samples <input id="bakeSamples" type="range" min="1" max="32" step="1" value="1"></label>
+        <output id="bakeSamplesOut">1</output>
+        <label>Softness <input id="bakeSoftness" type="range" min="0" max="0.2" step="0.005" value="0.04"></label>
+        <output id="bakeSoftnessOut">0.04</output>
+      </details>
+      <button id="bakeShadowsBtn">Bake shadows (loaded regions)</button>
+      <button id="restoreLightmapBtn">Restore original lightmap</button>
+      <label class="check"><input id="showNVMOverlay" type="checkbox"> Show NVM cells (N)</label>
+      <details id="nvmSettings">
+        <summary>Advanced NVM</summary>
+        <p class="hint">Save automatically runs the map-only NVM rebuild for changed regions and their surrounding neighbours. Use this panel only for manual rebuilds or rollback.</p>
+        <label title="Slope limit in degrees. 0 disables slope blocking.">Slope <input id="nvmSlope" type="range" min="0" max="100" step="1" value="60"></label>
+        <output id="nvmSlopeOut">60</output>
+        <label class="check" title="Create a new .nvm for regions that have no existing one during manual rebuilds.">
+          <input id="nvmCreateMissing" type="checkbox" checked> Create NVM if missing
+        </label>
+        <button id="rebuildNVMBtn">Rebuild loaded NVMs now</button>
+        <button id="restoreNVMBtn">Restore original NVM</button>
+      </details>
+      <div id="bakeStatus" class="hint"></div>
+      <div id="cursorCoords" class="hint">-</div>
+    </section>
+
+    <section>
+      <div class="segmented" role="group" aria-label="Tool mode">
+        <button id="brushToolMode" class="active">Brush</button>
+        <button id="selectToolMode">Select</button>
+      </div>
+    </section>
+
+    <section id="brushControls">
+      <div class="segmented" role="group" aria-label="Brush mode">
+        <button id="raiseMode" class="active">Raise</button>
+        <button id="lowerMode">Lower</button>
+        <button id="equalizeMode" title="Middle-click to sample a target height; left-drag to flatten terrain to that height">Equalize</button>
+        <button id="tileMode">Tile</button>
+      </div>
+      <div id="equalizeStatus" class="hint" hidden>Middle-click terrain to sample target height</div>
+      <label>Radius <input id="brushRadius" type="range" min="40" max="500" step="10" value="180"></label>
+      <output id="radiusOut">180</output>
+      <label>Strength <input id="brushStrength" type="range" min="1" max="40" step="1" value="8"></label>
+      <output id="strengthOut">8</output>
+      <div id="tilePickerSection" hidden>
+        <input type="search" id="tileFilter" placeholder="Filter tiles" autocomplete="off">
+        <div id="tileGrid" class="tile-grid"></div>
+        <div id="tileStatus" class="hint">No tile selected</div>
+      </div>
+    </section>
+
+    <section id="selectControls" hidden>
+      <p class="hint">Object panel opens on the right. Click an object · hold left to drag · arrows / PgUp PgDn / , . fine-tune · Esc deselect.</p>
+    </section>
+
+    <section id="meta">
+      <dl>
+        <dt>Loaded</dt><dd id="loadedCount">0</dd>
+        <dt>Dirty</dt><dd id="dirtyCount">0</dd>
+        <dt>Objects</dt><dd id="objectCount">0</dd>
+        <dt>Active Map</dt><dd id="activeCount">0</dd>
+        <dt>RefRegion</dt><dd id="refText">None</dd>
+        <dt>Export</dt><dd id="exportDir" title="Saved files mirror here. Copy contents into your client / server.">-</dd>
+      </dl>
+    </section>
+  </aside>
+  <script src="/app.js"></script>
+</body>
+</html>

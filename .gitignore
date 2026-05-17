@@ -1,0 +1,11 @@
+.gocache/
+tmp/
+tmp*/
+.tmp_*/
+backups/
+*.bak
+*.bak.*
+*.exe
+*.exe~
+*.log
+*.go.[0-9]*
