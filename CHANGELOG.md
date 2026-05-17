@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.0.0 - 2026-05-17
+
+First stable working checkpoint for the map editor.
+
+- Fixed custom object collision alignment through correct BSR/BMS collision metadata and map-only NVM object references.
+- Added stable map-only NVM rebuild from map files, including clean reciprocal global edge synchronization.
+- Fixed bridge/terrain handoff by assigning bridge object cells from the BMS navmesh footprint instead of an oversized bbox.
+- Added selected-object handoff cell visualization for inspecting NVM object ownership in the editor.
+- Fixed bridge render culling by repairing `.o2` visibility block buckets from each object's rotated visual bbox.
+- Added `fixo2visibility` for patching existing map files with missing object visibility buckets.
+- Patched the current bridge test case in `D:\ExportedPK2\Map\92\148.o2` and mirrored it to `D:\ExportedPK2\export\Map\92\148.o2`.
+
+Verification:
+
+- `go test ./...`
+- `node --check internal/editor/static/app.js`
+- In-game validation for custom collision, bridge handoff, and bridge render visibility.
+
 ## working-bridge-handoff-2026-05-17
 
 Bridge/object handoff fix for map-only NVM rebuilds.

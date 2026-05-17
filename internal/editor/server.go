@@ -1477,6 +1477,14 @@ func (s *Server) handleSaveRegionObjects(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	res := o2.ApplyChanges(req.Edits, req.Deletes, req.Adds)
+	visibilityKeys := make(map[uint64]bool)
+	for _, edit := range req.Edits {
+		visibilityKeys[placementKey(edit.RegionID, edit.UID, edit.ObjID)] = true
+	}
+	for _, added := range res.Added {
+		visibilityKeys[placementKey(added.RegionID, added.UID, added.ObjID)] = true
+	}
+	visibilityRepaired := s.normalizeChangedO2Visibility(o2, req.X, req.Y, visibilityKeys)
 	if err := o2.Save(path); err != nil {
 		writeError(w, http.StatusInternalServerError, "save: "+err.Error())
 		return
@@ -1496,10 +1504,11 @@ func (s *Server) handleSaveRegionObjects(w http.ResponseWriter, r *http.Request)
 		s.mirrorMapPlacementFiles(objID, nil)
 	}
 	writeJSON(w, map[string]any{
-		"path":    path,
-		"updated": res.Updated,
-		"deleted": res.Deleted,
-		"added":   res.Added,
+		"path":               path,
+		"updated":            res.Updated,
+		"deleted":            res.Deleted,
+		"added":              res.Added,
+		"visibilityRepaired": visibilityRepaired,
 	})
 }
 
