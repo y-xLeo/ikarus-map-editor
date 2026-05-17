@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"io/fs"
 	"math"
@@ -105,6 +106,20 @@ type saveRegionRequest struct {
 	Heights    []float32 `json:"heights"`
 	TextureIDs []uint16  `json:"textureIDs,omitempty"`
 	SyncNVM    bool      `json:"syncNvm"`
+}
+
+type texturePreviewRequest struct {
+	X          int                  `json:"x"`
+	Y          int                  `json:"y"`
+	TextureIDs []uint16             `json:"textureIDs"`
+	Patch      *texturePreviewPatch `json:"patch,omitempty"`
+}
+
+type texturePreviewPatch struct {
+	MinTileX int `json:"minTileX"`
+	MinTileZ int `json:"minTileZ"`
+	MaxTileX int `json:"maxTileX"`
+	MaxTileZ int `json:"maxTileZ"`
 }
 
 type saveRegionResponse struct {
@@ -219,6 +234,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/region", s.handleRegion)
 	mux.HandleFunc("/api/region/save", s.handleSaveRegion)
 	mux.HandleFunc("/api/region/texture", s.handleRegionTexture)
+	mux.HandleFunc("/api/region/texture/preview", s.handleRegionTexturePreview)
 	mux.HandleFunc("/api/region/lightmap", s.handleRegionLightmap)
 	mux.HandleFunc("/api/region/bake-shadows", s.handleBakeShadows)
 	mux.HandleFunc("/api/region/restore-lightmap", s.handleRestoreLightmap)
@@ -878,6 +894,87 @@ func (s *Server) handleRegionTexture(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "private, max-age=600")
+	w.Header().Set("X-Texture-Size", fmt.Sprintf("%dx%d", rt.width, rt.height))
+	_, _ = w.Write(rt.png)
+}
+
+func (s *Server) handleRegionTexturePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if len(s.tiles) == 0 {
+		writeError(w, http.StatusNotFound, "tile2d.ifo not loaded")
+		return
+	}
+	var req texturePreviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "decode request: "+err.Error())
+		return
+	}
+	if err := validateRegion(req.X, req.Y); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var (
+		rt  *regionTexture
+		err error
+	)
+	if req.Patch != nil {
+		p := req.Patch
+		if p.MinTileX < 0 || p.MinTileZ < 0 || p.MaxTileX >= sromap.NVMTileCount || p.MaxTileZ >= sromap.NVMTileCount ||
+			p.MinTileX > p.MaxTileX || p.MinTileZ > p.MaxTileZ {
+			writeError(w, http.StatusBadRequest, "invalid texture patch bounds")
+			return
+		}
+		expectedPatchIDs := (p.MaxTileX - p.MinTileX + 2) * (p.MaxTileZ - p.MinTileZ + 2)
+		if r.URL.Query().Get("raw") == "1" {
+			var img *image.RGBA
+			switch len(req.TextureIDs) {
+			case sromap.MeshGridSize * sromap.MeshGridSize:
+				img, err = s.textures.buildCompositeIDRange(req.TextureIDs, p.MinTileX, p.MinTileZ, p.MaxTileX, p.MaxTileZ)
+			case expectedPatchIDs:
+				img, err = s.textures.buildCompositePatchGrid(req.TextureIDs, p.MinTileX, p.MinTileZ, p.MaxTileX, p.MaxTileZ)
+			default:
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("texture patch must contain %d or %d values, got %d", sromap.MeshGridSize*sromap.MeshGridSize, expectedPatchIDs, len(req.TextureIDs)))
+				return
+			}
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Texture-Format", "rgba8")
+			w.Header().Set("X-Texture-Size", fmt.Sprintf("%dx%d", img.Rect.Dx(), img.Rect.Dy()))
+			w.Header().Set("X-Texture-Offset", fmt.Sprintf("%d,%d", p.MinTileX*compositeTileSize, p.MinTileZ*compositeTileSize))
+			_, _ = w.Write(img.Pix[:img.Rect.Dy()*img.Stride])
+			return
+		}
+		switch len(req.TextureIDs) {
+		case sromap.MeshGridSize * sromap.MeshGridSize:
+			rt, err = s.textures.regionCompositePatchFromIDs(req.TextureIDs, p.MinTileX, p.MinTileZ, p.MaxTileX, p.MaxTileZ)
+		case expectedPatchIDs:
+			rt, err = s.textures.regionCompositePatchGridFromIDs(req.TextureIDs, p.MinTileX, p.MinTileZ, p.MaxTileX, p.MaxTileZ)
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("texture patch must contain %d or %d values, got %d", sromap.MeshGridSize*sromap.MeshGridSize, expectedPatchIDs, len(req.TextureIDs)))
+			return
+		}
+		w.Header().Set("X-Texture-Offset", fmt.Sprintf("%d,%d", p.MinTileX*compositeTileSize, p.MinTileZ*compositeTileSize))
+	} else {
+		if len(req.TextureIDs) != sromap.MeshGridSize*sromap.MeshGridSize {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("texture map must contain %d values", sromap.MeshGridSize*sromap.MeshGridSize))
+			return
+		}
+		rt, err = s.textures.regionCompositeFromIDs(req.TextureIDs)
+		w.Header().Set("X-Texture-Offset", "0,0")
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Texture-Size", fmt.Sprintf("%dx%d", rt.width, rt.height))
 	_, _ = w.Write(rt.png)
 }

@@ -9,82 +9,372 @@
 <body>
   <canvas id="view"></canvas>
 
-  <div id="worldMap" hidden>
-    <header>
-      <h2>World Map</h2>
-      <span id="worldMapCoords">-</span>
-      <button id="worldMapMode" data-mode="navigate" title="Toggle between teleport and region-edit mode">Mode: Teleport</button>
-      <button id="worldMapClose" title="Close (M / Esc)">×</button>
+  <!-- Inline SVG icon symbols -->
+  <svg width="0" height="0" class="svg-defs" aria-hidden="true">
+    <defs>
+      <symbol id="icon-region" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 6.5 9 4l6 2 6-2v13.5L15 20l-6-2-6 2.5z"/>
+        <path d="M9 4v14M15 6v14"/>
+      </symbol>
+      <symbol id="icon-brush" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14.5 4.5 19.5 9.5 11 18l-5-5z"/>
+        <path d="M6 13c-2 0-3 1.5-3 3.5C3 18.5 4.5 21 7 21c2 0 3-1.5 3-3"/>
+      </symbol>
+      <symbol id="icon-cursor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 3v15l4-4h6z"/>
+        <path d="M14 14l4 7"/>
+      </symbol>
+      <symbol id="icon-tiles" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="7" height="7" rx="1"/>
+        <rect x="14" y="3" width="7" height="7" rx="1"/>
+        <rect x="3" y="14" width="7" height="7" rx="1"/>
+        <rect x="14" y="14" width="7" height="7" rx="1"/>
+      </symbol>
+      <symbol id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+      </symbol>
+      <symbol id="icon-mesh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3 4 7v10l8 4 8-4V7z"/>
+        <path d="M4 7l8 4 8-4M12 11v10"/>
+      </symbol>
+      <symbol id="icon-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"/>
+        <path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>
+      </symbol>
+      <symbol id="icon-stats" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>
+      </symbol>
+      <symbol id="icon-cube" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3 4 7v10l8 4 8-4V7z"/>
+        <path d="M4 7l8 4 8-4M12 11v10"/>
+      </symbol>
+      <symbol id="icon-save" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 3h11l4 4v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/>
+        <path d="M7 3v5h9V3M7 21v-7h10v7"/>
+      </symbol>
+      <symbol id="icon-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 5l14 14M19 5 5 19"/>
+      </symbol>
+      <symbol id="icon-grip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/>
+        <circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/>
+        <circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/>
+      </symbol>
+      <symbol id="icon-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 9l6 6 6-6"/>
+      </symbol>
+    </defs>
+  </svg>
+
+  <!-- Top bar -->
+  <header class="topbar" role="toolbar">
+    <div class="topbar-section topbar-left">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div class="brand-text">
+          <span class="brand-name">SRO Map Editor</span>
+          <span class="brand-sub">live world</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="topbar-section topbar-center">
+      <div class="segmented topbar-segmented" role="group" aria-label="Tool mode">
+        <button id="brushToolMode" class="active" type="button">
+          <svg class="ico"><use href="#icon-brush"/></svg>
+          <span>Brush</span>
+        </button>
+        <button id="selectToolMode" type="button">
+          <svg class="ico"><use href="#icon-cursor"/></svg>
+          <span>Select</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="topbar-section topbar-right">
+      <div id="status" class="topbar-status" title="Editor status">Starting</div>
+      <button id="saveAllBtn" class="topbar-save" disabled type="button">Saved</button>
+    </div>
+  </header>
+
+  <!-- Right side icon rail -->
+  <nav class="rail" aria-label="Editor panels">
+    <button class="rail-btn" data-panel="regionPanel" data-tooltip="Region · load coords">
+      <svg class="rail-icon"><use href="#icon-region"/></svg>
+    </button>
+    <button class="rail-btn" data-panel="sculptPanel" data-tooltip="Sculpt · brush settings">
+      <svg class="rail-icon"><use href="#icon-brush"/></svg>
+    </button>
+    <button class="rail-btn" data-panel="tilesPanel" data-tooltip="Tiles · texture picker">
+      <svg class="rail-icon"><use href="#icon-tiles"/></svg>
+    </button>
+    <button class="rail-btn" data-panel="lightingPanel" data-tooltip="Lighting · shadow bake">
+      <svg class="rail-icon"><use href="#icon-sun"/></svg>
+    </button>
+    <button class="rail-btn" data-panel="nvmPanel" data-tooltip="Navmesh · NVM rebuild">
+      <svg class="rail-icon"><use href="#icon-mesh"/></svg>
+    </button>
+    <button class="rail-btn" data-panel="worldMapTrigger" data-tooltip="World map (M)">
+      <svg class="rail-icon"><use href="#icon-globe"/></svg>
+    </button>
+    <div class="rail-spacer"></div>
+    <button class="rail-btn" data-panel="statsPanel" data-tooltip="Stats · session info">
+      <svg class="rail-icon"><use href="#icon-stats"/></svg>
+    </button>
+  </nav>
+
+  <!-- Floating panels -->
+  <aside class="dock-panel" id="regionPanel" data-default-x="auto" hidden>
+    <header class="dock-header" data-drag-handle>
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-region"/></svg></span>
+      <h2 class="dock-title">Region</h2>
+      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
     </header>
-    <canvas id="worldMapCanvas"></canvas>
-    <div id="worldMapActions" hidden>
-      <span id="worldMapSelInfo">-</span>
-      <button id="worldMapCopyBtn">Copy</button>
-      <button id="worldMapCreateBtn">Create…</button>
-      <button id="worldMapDeleteBtn" class="danger">Delete…</button>
-      <button id="worldMapClearSelBtn">Clear</button>
+    <div class="dock-body">
+      <div class="field-row">
+        <label class="field"><span class="field-label">Region X</span><input id="regionX" type="number" min="0" max="255" step="1"></label>
+        <label class="field"><span class="field-label">Region Y</span><input id="regionY" type="number" min="0" max="127" step="1"></label>
+      </div>
+      <label class="field"><span class="field-label">Load Radius</span><input id="loadRadius" type="number" min="0" max="4" step="1" value="1"></label>
+      <button id="loadBtn" class="btn btn-primary" type="button">Load Region (recenter)</button>
+      <label class="check"><input id="streamingToggle" type="checkbox" checked> <span>Stream regions automatically</span></label>
+      <p class="hint">As the camera flies over neighbours, regions load in radius. Press <kbd>M</kbd> for the world map.</p>
     </div>
-    <div id="worldMapPasteBar" hidden>
-      <span id="worldMapPasteInfo">-</span>
-      <button id="worldMapCancelPasteBtn">Cancel (Esc)</button>
+  </aside>
+
+  <aside class="dock-panel" id="sculptPanel" hidden>
+    <header class="dock-header" data-drag-handle>
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-brush"/></svg></span>
+      <h2 class="dock-title">Sculpt</h2>
+      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
+    </header>
+    <div class="dock-body">
+      <section id="brushControls">
+        <div class="segmented" role="group" aria-label="Brush mode">
+          <button id="raiseMode" class="active" type="button">Raise</button>
+          <button id="lowerMode" type="button">Lower</button>
+          <button id="equalizeMode" type="button" title="Middle-click to sample a target height; left-drag to flatten terrain to that height">Equalize</button>
+          <button id="tileMode" type="button">Tile</button>
+        </div>
+        <div id="equalizeStatus" class="hint inline-status" hidden>Middle-click terrain to sample target height</div>
+        <div class="slider-block">
+          <div class="slider-head"><span class="slider-name">Radius</span><output id="radiusOut" class="slider-val">180</output></div>
+          <input id="brushRadius" type="range" min="40" max="500" step="10" value="180">
+        </div>
+        <div class="slider-block">
+          <div class="slider-head"><span class="slider-name">Strength</span><output id="strengthOut" class="slider-val">8</output></div>
+          <input id="brushStrength" type="range" min="1" max="40" step="1" value="8">
+        </div>
+      </section>
+      <section id="selectControls" hidden>
+        <p class="hint">Select mode active. Click an object · hold left to drag · arrows / PgUp PgDn / , . fine-tune · Esc deselect.</p>
+        <p class="hint">The Object panel opens automatically when you pick something.</p>
+      </section>
+      <!-- The tile-picker controls live in the Tiles panel; keep #tilePickerSection there. -->
     </div>
-    <p class="hint" id="worldMapHint">Click any tile to teleport. Green = active · Yellow = has ref · Orange outline = loaded · Red dot = current position.</p>
+  </aside>
+
+  <aside class="dock-panel" id="tilesPanel" hidden>
+    <header class="dock-header" data-drag-handle>
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-tiles"/></svg></span>
+      <h2 class="dock-title">Tile picker</h2>
+      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
+    </header>
+    <div class="dock-body">
+      <div id="tilePickerSection">
+        <p class="hint">Pick a tile then switch the brush to <strong>Tile</strong> in the Sculpt panel.</p>
+        <input type="search" id="tileFilter" placeholder="Filter tiles" autocomplete="off">
+        <div id="tileGrid" class="tile-grid"></div>
+        <div id="tileStatus" class="hint">No tile selected</div>
+      </div>
+    </div>
+  </aside>
+
+  <aside class="dock-panel" id="lightingPanel" hidden>
+    <header class="dock-header" data-drag-handle>
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-sun"/></svg></span>
+      <h2 class="dock-title">Lighting &amp; shadows</h2>
+      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
+    </header>
+    <div class="dock-body">
+      <div class="slider-block">
+        <div class="slider-head"><span class="slider-name">Sun shadow</span><output id="lightmapStrengthOut" class="slider-val">0.6</output></div>
+        <input id="lightmapStrength" type="range" min="0" max="1" step="0.05" value="0.6">
+      </div>
+      <details id="bakeSettings" class="dock-details">
+        <summary><span>Bake settings</span><svg class="ico chev"><use href="#icon-chevron"/></svg></summary>
+        <div class="details-body">
+          <div class="slider-block">
+            <div class="slider-head"><span class="slider-name">Azimuth</span><output id="bakeAzimuthOut" class="slider-val">75</output></div>
+            <input id="bakeAzimuth" type="range" min="0" max="359" step="1" value="75">
+          </div>
+          <div class="slider-block">
+            <div class="slider-head"><span class="slider-name">Elevation</span><output id="bakeElevationOut" class="slider-val">40</output></div>
+            <input id="bakeElevation" type="range" min="10" max="89" step="1" value="40">
+          </div>
+          <div class="slider-block">
+            <div class="slider-head"><span class="slider-name">Samples</span><output id="bakeSamplesOut" class="slider-val">1</output></div>
+            <input id="bakeSamples" type="range" min="1" max="32" step="1" value="1">
+          </div>
+          <div class="slider-block">
+            <div class="slider-head"><span class="slider-name">Softness</span><output id="bakeSoftnessOut" class="slider-val">0.04</output></div>
+            <input id="bakeSoftness" type="range" min="0" max="0.2" step="0.005" value="0.04">
+          </div>
+        </div>
+      </details>
+      <div class="btn-row">
+        <button id="bakeShadowsBtn" class="btn btn-primary" type="button">Bake shadows</button>
+        <button id="restoreLightmapBtn" class="btn btn-ghost" type="button">Restore</button>
+      </div>
+      <div id="bakeStatus" class="hint inline-status"></div>
+    </div>
+  </aside>
+
+  <aside class="dock-panel" id="nvmPanel" hidden>
+    <header class="dock-header" data-drag-handle>
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-mesh"/></svg></span>
+      <h2 class="dock-title">Navmesh (NVM)</h2>
+      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
+    </header>
+    <div class="dock-body">
+      <label class="check"><input id="showNVMOverlay" type="checkbox"> <span>Show NVM cells <kbd>N</kbd></span></label>
+      <details id="nvmSettings" class="dock-details">
+        <summary><span>Advanced NVM</span><svg class="ico chev"><use href="#icon-chevron"/></svg></summary>
+        <div class="details-body">
+          <p class="hint">Save automatically runs the map-only NVM rebuild for changed regions and their neighbours. Use this only for manual rebuilds or rollback.</p>
+          <div class="slider-block">
+            <div class="slider-head"><span class="slider-name" title="Slope limit in degrees. 0 disables slope blocking.">Slope limit</span><output id="nvmSlopeOut" class="slider-val">60</output></div>
+            <input id="nvmSlope" type="range" min="0" max="100" step="1" value="60">
+          </div>
+          <label class="check" title="Create a new .nvm for regions that have no existing one during manual rebuilds.">
+            <input id="nvmCreateMissing" type="checkbox" checked> <span>Create NVM if missing</span>
+          </label>
+          <div class="btn-row">
+            <button id="rebuildNVMBtn" class="btn btn-primary" type="button">Rebuild loaded</button>
+            <button id="restoreNVMBtn" class="btn btn-ghost" type="button">Restore</button>
+          </div>
+        </div>
+      </details>
+    </div>
+  </aside>
+
+  <aside class="dock-panel dock-panel-compact" id="statsPanel" hidden>
+    <header class="dock-header" data-drag-handle>
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-stats"/></svg></span>
+      <h2 class="dock-title">Session stats</h2>
+      <button class="dock-close" type="button" aria-label="Close panel" data-close-panel><svg class="ico"><use href="#icon-x"/></svg></button>
+    </header>
+    <div class="dock-body">
+      <dl class="stat-grid">
+        <dt>Loaded</dt><dd id="loadedCount">0</dd>
+        <dt>Dirty</dt><dd id="dirtyCount">0</dd>
+        <dt>Objects</dt><dd id="objectCount">0</dd>
+        <dt>Active map</dt><dd id="activeCount">0</dd>
+        <dt>RefRegion</dt><dd id="refText">None</dd>
+        <dt>Export</dt><dd id="exportDir" title="Saved files mirror here. Copy contents into your client / server.">-</dd>
+      </dl>
+    </div>
+  </aside>
+
+  <!-- Floating cursor coords overlay -->
+  <div class="cursor-chip">
+    <span class="chip-dot"></span>
+    <span id="cursorCoords">-</span>
   </div>
 
-  <dialog id="createRegionDialog">
+  <!-- World map overlay -->
+  <div id="worldMap" hidden>
+    <div class="world-shell">
+      <header class="world-header">
+        <h2>World Map</h2>
+        <span id="worldMapCoords">-</span>
+        <button id="worldMapMode" class="btn btn-ghost btn-sm" data-mode="navigate" title="Toggle between teleport and region-edit mode" type="button">Mode: Teleport</button>
+        <button id="worldMapClose" class="dock-close" title="Close (M / Esc)" type="button"><svg class="ico"><use href="#icon-x"/></svg></button>
+      </header>
+      <canvas id="worldMapCanvas"></canvas>
+      <div id="worldMapActions" class="world-actions" hidden>
+        <span id="worldMapSelInfo">-</span>
+        <button id="worldMapCopyBtn" class="btn btn-ghost btn-sm" type="button">Copy</button>
+        <button id="worldMapCreateBtn" class="btn btn-primary btn-sm" type="button">Create…</button>
+        <button id="worldMapDeleteBtn" class="btn btn-danger btn-sm" type="button">Delete…</button>
+        <button id="worldMapClearSelBtn" class="btn btn-ghost btn-sm" type="button">Clear</button>
+      </div>
+      <div id="worldMapPasteBar" class="world-paste" hidden>
+        <span id="worldMapPasteInfo">-</span>
+        <button id="worldMapCancelPasteBtn" class="btn btn-ghost btn-sm" type="button">Cancel (Esc)</button>
+      </div>
+      <p class="hint world-hint" id="worldMapHint">Click any tile to teleport. <span class="legend g">●</span> active · <span class="legend y">●</span> has ref · <span class="legend o">●</span> loaded · <span class="legend r">●</span> current position.</p>
+    </div>
+  </div>
+
+  <!-- Dialogs -->
+  <dialog id="createRegionDialog" class="ui-dialog">
     <form method="dialog">
       <h3>Create flat regions</h3>
       <p class="hint" id="createRegionSummary">-</p>
-      <label>Target Y height
+      <label class="field">
+        <span class="field-label">Target Y height</span>
         <input type="number" id="createRegionHeight" value="100" step="10">
       </label>
       <div class="dialog-actions">
-        <button value="cancel">Cancel</button>
-        <button value="confirm" id="createRegionConfirm" class="primary">Create</button>
+        <button value="cancel" class="btn btn-ghost">Cancel</button>
+        <button value="confirm" id="createRegionConfirm" class="btn btn-primary">Create</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="deleteRegionDialog">
+  <dialog id="deleteRegionDialog" class="ui-dialog">
     <form method="dialog">
       <h3>Delete regions</h3>
       <p class="hint" id="deleteRegionSummary">-</p>
       <p class="hint">Removes the .m, .o2 and .nvm files for each region and clears the mapinfo bit. Existing .bak files are kept.</p>
       <div class="dialog-actions">
-        <button value="cancel">Cancel</button>
-        <button value="confirm" id="deleteRegionConfirm" class="danger">Delete</button>
+        <button value="cancel" class="btn btn-ghost">Cancel</button>
+        <button value="confirm" id="deleteRegionConfirm" class="btn btn-danger">Delete</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="importCustomObjectDialog">
+  <dialog id="importCustomObjectDialog" class="ui-dialog">
     <form method="dialog">
       <h3>Import OBJ folder</h3>
       <p class="hint">Point at a folder containing a <code>base.obj</code> and (optionally) a <code>texture_diffuse.png</code>. Meshy.ai's default output layout works out of the box.</p>
-      <label>Folder path
-        <input type="text" id="importCustomFolder" placeholder="D:\\ExportedPK2\\test_new_obj" autocomplete="off" autofocus>
+      <label class="field">
+        <span class="field-label">Folder path</span>
+        <input type="text" id="importCustomFolder" placeholder="D:\ExportedPK2\test_new_obj" autocomplete="off" autofocus>
       </label>
-      <label>Display name <small>(optional)</small>
+      <label class="field">
+        <span class="field-label">Display name <small>(optional)</small></span>
         <input type="text" id="importCustomName" placeholder="Defaults to folder name" autocomplete="off">
       </label>
-      <label>Target size <small>(world units, longest axis)</small>
+      <label class="field">
+        <span class="field-label">Target size <small>(world units, longest axis)</small></span>
         <input type="number" id="importCustomSize" value="300" min="1" max="5000" step="10">
       </label>
       <div class="dialog-actions">
-        <button value="cancel">Cancel</button>
-        <button value="confirm" class="primary">Import</button>
+        <button value="cancel" class="btn btn-ghost">Cancel</button>
+        <button value="confirm" class="btn btn-primary">Import</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="pasteRegionDialog">
+  <dialog id="pasteRegionDialog" class="ui-dialog">
     <form method="dialog">
       <h3>Paste copied regions</h3>
       <p class="hint" id="pasteRegionSummary">-</p>
-      <label>Target floor Y
+      <label class="field">
+        <span class="field-label">Target floor Y</span>
         <input type="number" id="pasteRegionFloor" placeholder="leave blank to keep">
       </label>
-      <label>Rotation
+      <label class="field">
+        <span class="field-label">Rotation</span>
         <select id="pasteRegionRotation">
           <option value="0">0°</option>
           <option value="90">90° CW</option>
@@ -92,23 +382,26 @@
           <option value="270">270° CW (= 90° CCW)</option>
         </select>
       </label>
-      <label class="check"><input type="checkbox" id="pasteRegionFlipX"> Flip X (mirror east ↔ west)</label>
-      <label class="check"><input type="checkbox" id="pasteRegionFlipZ"> Flip Z (mirror north ↔ south)</label>
+      <label class="check"><input type="checkbox" id="pasteRegionFlipX"> <span>Flip X (mirror east ↔ west)</span></label>
+      <label class="check"><input type="checkbox" id="pasteRegionFlipZ"> <span>Flip Z (mirror north ↔ south)</span></label>
       <p class="hint">Rotation is applied first, then flips. The bundle's bounding box also rotates — a 3×2 paste becomes 2×3 at 90°/270°.</p>
       <p class="hint">If a target floor Y is set, the bundle's lowest point lifts to that Y; everything (terrain, objects, NVM heights) shifts by the same delta — relative geometry is preserved.</p>
       <div class="dialog-actions">
-        <button value="cancel">Cancel</button>
-        <button value="confirm" id="pasteRegionConfirm" class="primary">Paste</button>
+        <button value="cancel" class="btn btn-ghost">Cancel</button>
+        <button value="confirm" id="pasteRegionConfirm" class="btn btn-primary">Paste</button>
       </div>
     </form>
   </dialog>
 
-  <aside id="objectPanel" hidden>
-    <header id="objectPanelHeader">
-      <h2>Object</h2>
+  <!-- Object panel (auto-opens in Select mode) -->
+  <aside id="objectPanel" class="dock-panel" hidden>
+    <header id="objectPanelHeader" class="dock-header">
+      <span class="dock-grip" aria-hidden="true"><svg class="ico"><use href="#icon-grip"/></svg></span>
+      <span class="dock-title-icon" aria-hidden="true"><svg class="ico"><use href="#icon-cube"/></svg></span>
+      <h2 class="dock-title">Object</h2>
       <span class="drag-hint">drag to move</span>
     </header>
-    <div class="object-panel-body">
+    <div class="dock-body object-panel-body">
       <div id="selectInfo">
         <div class="obj-name" id="selObjName">None</div>
         <div class="hint" id="selObjMeta">-</div>
@@ -142,111 +435,29 @@
           <button type="button" data-rot="180">180°</button>
         </div>
       </fieldset>
-      <button id="snapToTerrainBtn">Snap to terrain</button>
-      <button id="resetObjectBtn">Reset to original</button>
-      <button id="deleteObjectBtn">Delete (Del key)</button>
-      <label class="check object-overlay-toggle"><input id="showObjectCollision" type="checkbox"> Show collision footprints</label>
-      <label class="check object-overlay-toggle"><input id="showHandoffOverlay" type="checkbox"> Show selected handoff cells</label>
+      <div class="btn-row">
+        <button id="snapToTerrainBtn" class="btn btn-primary" type="button">Snap to terrain</button>
+        <button id="resetObjectBtn" class="btn btn-ghost" type="button">Reset</button>
+      </div>
+      <button id="deleteObjectBtn" class="btn btn-danger" type="button">Delete (Del)</button>
+      <label class="check"><input id="showObjectCollision" type="checkbox"> <span>Show collision footprints</span></label>
+      <label class="check"><input id="showHandoffOverlay" type="checkbox"> <span>Show selected handoff cells</span></label>
       <hr class="divider">
-      <details id="spawnSection">
-        <summary>Spawn new object</summary>
-        <p class="hint">Aim cursor at terrain, then click an entry to spawn at the cursor.</p>
-        <button id="importCustomObjectBtn" type="button" title="Import a folder containing a base.obj + texture_diffuse.png (meshy.ai layout)">Import OBJ folder…</button>
-        <input type="search" id="spawnFilter" placeholder="Search by path or id" autocomplete="off">
-        <div id="spawnList" class="spawn-list"></div>
-        <div id="spawnStatus" class="hint"></div>
+      <details id="spawnSection" class="dock-details">
+        <summary><span>Spawn new object</span><svg class="ico chev"><use href="#icon-chevron"/></svg></summary>
+        <div class="details-body">
+          <p class="hint">Aim cursor at terrain, then click an entry to spawn at the cursor.</p>
+          <button id="importCustomObjectBtn" class="btn btn-ghost" type="button" title="Import a folder containing a base.obj + texture_diffuse.png (meshy.ai layout)">Import OBJ folder…</button>
+          <input type="search" id="spawnFilter" placeholder="Search by path or id" autocomplete="off">
+          <div id="spawnList" class="spawn-list"></div>
+          <div id="spawnStatus" class="hint"></div>
+        </div>
       </details>
-      <div id="objectSaveStatus" class="hint"></div>
+      <div id="objectSaveStatus" class="hint inline-status"></div>
     </div>
   </aside>
 
-  <aside id="panel">
-    <header>
-      <h1>SRO Map Editor</h1>
-      <button id="saveAllBtn" class="save-all" disabled>Saved</button>
-      <div id="status">Starting</div>
-    </header>
-
-    <section>
-      <label>Region X <input id="regionX" type="number" min="0" max="255" step="1"></label>
-      <label>Region Y <input id="regionY" type="number" min="0" max="127" step="1"></label>
-      <label>Load Radius <input id="loadRadius" type="number" min="0" max="4" step="1" value="1"></label>
-      <button id="loadBtn">Load Region (recenter)</button>
-      <label class="check" title="Auto-load regions in radius as the camera flies over them. Press M for the full world map.">
-        <input id="streamingToggle" type="checkbox" checked> Stream regions
-      </label>
-      <label>Sun shadow <input id="lightmapStrength" type="range" min="0" max="1" step="0.05" value="0.6"></label>
-      <output id="lightmapStrengthOut">0.6</output>
-      <details id="bakeSettings">
-        <summary>Bake settings</summary>
-        <label>Azimuth <input id="bakeAzimuth" type="range" min="0" max="359" step="1" value="75"></label>
-        <output id="bakeAzimuthOut">75</output>
-        <label>Elevation <input id="bakeElevation" type="range" min="10" max="89" step="1" value="40"></label>
-        <output id="bakeElevationOut">40</output>
-        <label>Samples <input id="bakeSamples" type="range" min="1" max="32" step="1" value="1"></label>
-        <output id="bakeSamplesOut">1</output>
-        <label>Softness <input id="bakeSoftness" type="range" min="0" max="0.2" step="0.005" value="0.04"></label>
-        <output id="bakeSoftnessOut">0.04</output>
-      </details>
-      <button id="bakeShadowsBtn">Bake shadows (loaded regions)</button>
-      <button id="restoreLightmapBtn">Restore original lightmap</button>
-      <label class="check"><input id="showNVMOverlay" type="checkbox"> Show NVM cells (N)</label>
-      <details id="nvmSettings">
-        <summary>Advanced NVM</summary>
-        <p class="hint">Save automatically runs the map-only NVM rebuild for changed regions and their surrounding neighbours. Use this panel only for manual rebuilds or rollback.</p>
-        <label title="Slope limit in degrees. 0 disables slope blocking.">Slope <input id="nvmSlope" type="range" min="0" max="100" step="1" value="60"></label>
-        <output id="nvmSlopeOut">60</output>
-        <label class="check" title="Create a new .nvm for regions that have no existing one during manual rebuilds.">
-          <input id="nvmCreateMissing" type="checkbox" checked> Create NVM if missing
-        </label>
-        <button id="rebuildNVMBtn">Rebuild loaded NVMs now</button>
-        <button id="restoreNVMBtn">Restore original NVM</button>
-      </details>
-      <div id="bakeStatus" class="hint"></div>
-      <div id="cursorCoords" class="hint">-</div>
-    </section>
-
-    <section>
-      <div class="segmented" role="group" aria-label="Tool mode">
-        <button id="brushToolMode" class="active">Brush</button>
-        <button id="selectToolMode">Select</button>
-      </div>
-    </section>
-
-    <section id="brushControls">
-      <div class="segmented" role="group" aria-label="Brush mode">
-        <button id="raiseMode" class="active">Raise</button>
-        <button id="lowerMode">Lower</button>
-        <button id="equalizeMode" title="Middle-click to sample a target height; left-drag to flatten terrain to that height">Equalize</button>
-        <button id="tileMode">Tile</button>
-      </div>
-      <div id="equalizeStatus" class="hint" hidden>Middle-click terrain to sample target height</div>
-      <label>Radius <input id="brushRadius" type="range" min="40" max="500" step="10" value="180"></label>
-      <output id="radiusOut">180</output>
-      <label>Strength <input id="brushStrength" type="range" min="1" max="40" step="1" value="8"></label>
-      <output id="strengthOut">8</output>
-      <div id="tilePickerSection" hidden>
-        <input type="search" id="tileFilter" placeholder="Filter tiles" autocomplete="off">
-        <div id="tileGrid" class="tile-grid"></div>
-        <div id="tileStatus" class="hint">No tile selected</div>
-      </div>
-    </section>
-
-    <section id="selectControls" hidden>
-      <p class="hint">Object panel opens on the right. Click an object · hold left to drag · arrows / PgUp PgDn / , . fine-tune · Esc deselect.</p>
-    </section>
-
-    <section id="meta">
-      <dl>
-        <dt>Loaded</dt><dd id="loadedCount">0</dd>
-        <dt>Dirty</dt><dd id="dirtyCount">0</dd>
-        <dt>Objects</dt><dd id="objectCount">0</dd>
-        <dt>Active Map</dt><dd id="activeCount">0</dd>
-        <dt>RefRegion</dt><dd id="refText">None</dd>
-        <dt>Export</dt><dd id="exportDir" title="Saved files mirror here. Copy contents into your client / server.">-</dd>
-      </dl>
-    </section>
-  </aside>
+  <script src="/panels.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

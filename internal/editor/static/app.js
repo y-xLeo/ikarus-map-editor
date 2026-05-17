@@ -1,6 +1,19 @@
 const REGION_SIZE = 1920;
 const CELL_SIZE = 20;
 const GRID_SIZE = 97;
+const COMPOSITE_TILE_SIZE = 16;
+const COMPOSITE_TILES = GRID_SIZE - 1;
+const BRUSH_CIRCLE_SEGMENTS = 96;
+const BRUSH_CIRCLE_UNIT = (() => {
+  const data = new Float32Array(BRUSH_CIRCLE_SEGMENTS * 2);
+  for (let i = 0; i < BRUSH_CIRCLE_SEGMENTS; i++) {
+    const a = (i / BRUSH_CIRCLE_SEGMENTS) * Math.PI * 2;
+    data[i * 2] = Math.cos(a);
+    data[i * 2 + 1] = Math.sin(a);
+  }
+  return data;
+})();
+const brushCircleData = new Float32Array(BRUSH_CIRCLE_SEGMENTS * 3);
 
 const canvas = document.getElementById("view");
 const gl = canvas.getContext("webgl", { antialias: true });
@@ -141,6 +154,9 @@ const state = {
   showNVMOverlay: false,
   showObjectCollision: false,
   showHandoffOverlay: false,
+  collisionOverlayDirty: true,
+  collisionFillCount: 0,
+  collisionLineCount: 0,
   undoStack: [],
   redoStack: [],
   undoLimit: 100,
@@ -507,8 +523,11 @@ canvas.addEventListener("mousedown", e => {
     }
   }
   if (e.button === 1) {
-    // Middle-click in equalize mode samples the terrain under cursor.
-    if (state.toolMode === "brush" && state.brushMode === "equalize" && state.hover) {
+    if (state.toolMode === "brush" && state.brushMode === "tile" && state.hover) {
+      e.preventDefault();
+      pickTileAtHover();
+    } else if (state.toolMode === "brush" && state.brushMode === "equalize" && state.hover) {
+      // Middle-click in equalize mode samples the terrain height under cursor.
       e.preventDefault();
       state.equalizeTarget = state.hover.y;
       refreshEqualizeStatus();
@@ -812,6 +831,18 @@ function loadRegionLightmap(region, bust) {
   img.src = url;
 }
 
+function uploadRegionTexture(region, img) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  if (region.texture) gl.deleteTexture(region.texture);
+  region.texture = tex;
+}
+
 function loadRegionTexture(region) {
   const url = region.textureURL;
   if (!url) return;
@@ -820,20 +851,181 @@ function loadRegionTexture(region) {
   img.onload = () => {
     const current = state.regions.get(key);
     if (current !== region) return;
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    if (region.texture) gl.deleteTexture(region.texture);
-    region.texture = tex;
+    uploadRegionTexture(region, img);
   };
   img.onerror = () => {
     // texture load failed; fallback shading stays
   };
   img.src = url;
+}
+
+function scheduleTilePreviewRefresh(region, patch) {
+  region.tilePreviewSeq = (region.tilePreviewSeq || 0) + 1;
+  mergeTilePreviewPatch(region, patch);
+  if (region.tilePreviewTimer) clearTimeout(region.tilePreviewTimer);
+  region.tilePreviewTimer = setTimeout(() => refreshTilePreview(region), 30);
+}
+
+function mergeTilePreviewPatch(region, patch) {
+  if (!patch) {
+    region.tilePreviewFull = true;
+    region.tilePreviewPatch = null;
+    return;
+  }
+  if (region.tilePreviewFull) return;
+  if (!region.tilePreviewPatch) {
+    region.tilePreviewPatch = { ...patch };
+    return;
+  }
+  region.tilePreviewPatch.minTileX = Math.min(region.tilePreviewPatch.minTileX, patch.minTileX);
+  region.tilePreviewPatch.minTileZ = Math.min(region.tilePreviewPatch.minTileZ, patch.minTileZ);
+  region.tilePreviewPatch.maxTileX = Math.max(region.tilePreviewPatch.maxTileX, patch.maxTileX);
+  region.tilePreviewPatch.maxTileZ = Math.max(region.tilePreviewPatch.maxTileZ, patch.maxTileZ);
+}
+
+function vertexBoundsToTexturePatch(minGX, minGZ, maxGX, maxGZ) {
+  if (maxGX < minGX || maxGZ < minGZ) return null;
+  return {
+    minTileX: clamp(minGX - 1, 0, COMPOSITE_TILES - 1),
+    minTileZ: clamp(minGZ - 1, 0, COMPOSITE_TILES - 1),
+    maxTileX: clamp(maxGX, 0, COMPOSITE_TILES - 1),
+    maxTileZ: clamp(maxGZ, 0, COMPOSITE_TILES - 1)
+  };
+}
+
+async function refreshTilePreview(region) {
+  region.tilePreviewTimer = 0;
+  const key = keyFor(region.x, region.y);
+  if (state.regions.get(key) !== region) return;
+  if (region.tilePreviewInFlight) {
+    region.tilePreviewPending = true;
+    return;
+  }
+  region.tilePreviewInFlight = true;
+  region.tilePreviewPending = false;
+  const seq = region.tilePreviewSeq || 0;
+  const patch = region.texture && !region.tilePreviewFull ? region.tilePreviewPatch : null;
+  region.tilePreviewPatch = null;
+  region.tilePreviewFull = false;
+  const body = {
+    x: region.x,
+    y: region.y,
+    textureIDs: patch ? textureIDsForPatch(region, patch) : Array.from(region.tileIDs)
+  };
+  if (patch) body.patch = patch;
+  try {
+    const res = await fetch(`/api/region/texture/preview${patch ? "?raw=1" : ""}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(await res.text());
+    if (patch) {
+      const size = parseTextureSizeHeader(res.headers.get("X-Texture-Size"));
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      await applyTilePreviewPatchRaw(region, bytes, seq, patch, size.width, size.height);
+    } else {
+      const blob = await res.blob();
+      await applyTilePreviewBlob(region, blob, seq);
+    }
+  } catch (err) {
+    console.warn("tile preview refresh failed:", err);
+    setStatus(`Tile preview failed: ${err.message}`);
+  } finally {
+    region.tilePreviewInFlight = false;
+    if (state.regions.get(key) === region && (region.tilePreviewPending || seq !== (region.tilePreviewSeq || 0))) {
+      region.tilePreviewPending = false;
+      refreshTilePreview(region);
+    }
+  }
+}
+
+function parseTextureSizeHeader(value) {
+  const m = /^(\d+)x(\d+)$/.exec(value || "");
+  if (!m) throw new Error("texture preview returned an invalid size");
+  return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+}
+
+function textureIDsForPatch(region, patch) {
+  const ids = [];
+  const maxGX = patch.maxTileX + 1;
+  const maxGZ = patch.maxTileZ + 1;
+  for (let gz = patch.minTileZ; gz <= maxGZ; gz++) {
+    const row = gz * GRID_SIZE;
+    for (let gx = patch.minTileX; gx <= maxGX; gx++) {
+      ids.push(region.tileIDs[row + gx] & 0x7FF);
+    }
+  }
+  return ids;
+}
+
+function applyTilePreviewPatchRaw(region, bytes, seq, patch, width, height) {
+  const key = keyFor(region.x, region.y);
+  if (state.regions.get(key) !== region || !region.texture) return;
+  if (bytes.byteLength !== width * height * 4) {
+    throw new Error("texture preview returned an invalid byte count");
+  }
+  gl.bindTexture(gl.TEXTURE_2D, region.texture);
+  gl.texSubImage2D(
+    gl.TEXTURE_2D,
+    0,
+    patch.minTileX * COMPOSITE_TILE_SIZE,
+    patch.minTileZ * COMPOSITE_TILE_SIZE,
+    width,
+    height,
+    gl.RGBA,
+    gl.UNSIGNED_BYTE,
+    bytes
+  );
+}
+
+function applyTilePreviewBlob(region, blob, seq) {
+  return new Promise((resolve, reject) => {
+    const key = keyFor(region.x, region.y);
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      if (state.regions.get(key) === region) {
+        uploadRegionTexture(region, img);
+      }
+      resolve();
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("could not decode preview texture"));
+    };
+    img.src = url;
+  });
+}
+
+function applyTilePreviewPatchBlob(region, blob, seq, patch) {
+  return new Promise((resolve, reject) => {
+    const key = keyFor(region.x, region.y);
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      if (state.regions.get(key) === region && region.texture) {
+        gl.bindTexture(gl.TEXTURE_2D, region.texture);
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          patch.minTileX * COMPOSITE_TILE_SIZE,
+          patch.minTileZ * COMPOSITE_TILE_SIZE,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          img
+        );
+      }
+      resolve();
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("could not decode preview texture patch"));
+    };
+    img.src = url;
+  });
 }
 
 function buildTerrainMesh(region) {
@@ -995,6 +1187,7 @@ function rebuildObjectMarkers() {
   gl.bufferData(gl.ARRAY_BUFFER, state.objects.position, gl.DYNAMIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, objectColorBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, state.objects.color, gl.DYNAMIC_DRAW);
+  state.collisionOverlayDirty = true;
 }
 
 async function fetchObjectAsset(id) {
@@ -1016,8 +1209,10 @@ async function fetchObjectAsset(id) {
       collisionNavOutlineIndices: data.collisionNavOutlineIndices || null,
       isCustom: !!data.isCustom
     });
+    state.collisionOverlayDirty = true;
   } catch (err) {
     state.objectAssets.set(id, { state: "error", meshes: null });
+    state.collisionOverlayDirty = true;
   }
 }
 
@@ -1352,9 +1547,20 @@ function applyBrushStroke(final, mode, sourceCol) {
     const region = state.regions.get(regionKey);
     if (!region) continue;
     if (mode === "tile") {
-      for (const t of triples) region.tileIDs[t[0]] = t[sourceCol];
+      let minGX = GRID_SIZE, minGZ = GRID_SIZE, maxGX = -1, maxGZ = -1;
+      for (const t of triples) {
+        const idx = t[0];
+        region.tileIDs[idx] = t[sourceCol];
+        const gx = idx % GRID_SIZE;
+        const gz = Math.floor(idx / GRID_SIZE);
+        minGX = Math.min(minGX, gx);
+        minGZ = Math.min(minGZ, gz);
+        maxGX = Math.max(maxGX, gx);
+        maxGZ = Math.max(maxGZ, gz);
+      }
       state.dirty.add(regionKey);
       state.tileDirty.add(regionKey);
+      scheduleTilePreviewRefresh(region, vertexBoundsToTexturePatch(minGX, minGZ, maxGX, maxGZ));
     } else {
       for (const t of triples) region.heights[t[0]] = t[sourceCol];
       buildTerrainMesh(region);
@@ -2551,6 +2757,12 @@ function updateHover() {
   updateCursorCoordsReadout();
 }
 
+function hoverLocalGrid() {
+  const region = state.hover?.region;
+  if (!region) return null;
+  return localGridAtWorld(region, state.hover.x, state.hover.z, true);
+}
+
 function updateCursorCoordsReadout() {
   if (!ui.cursorCoords) return;
   if (!state.hover) {
@@ -2558,18 +2770,27 @@ function updateCursorCoordsReadout() {
     return;
   }
   const region = state.hover.region;
-  if (!region) {
+  const local = hoverLocalGrid();
+  if (!region || !local) {
     ui.cursorCoords.textContent = "-";
     return;
   }
+  ui.cursorCoords.textContent =
+    `region ${region.x},${region.y}  local (${local.localX.toFixed(0)}, ${state.hover.y.toFixed(0)}, ${local.localZ.toFixed(0)})  grid ${local.gxRound},${local.gzRound}`;
+}
+
+function brushGridBounds(region, radius) {
   const offX = regionOffsetX(region.x);
   const offZ = regionOffsetZ(region.y);
   const localX = offX + 960 - state.hover.x;
   const localZ = state.hover.z - offZ + 960;
-  const gx = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(localX / CELL_SIZE)));
-  const gz = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(localZ / CELL_SIZE)));
-  ui.cursorCoords.textContent =
-    `region ${region.x},${region.y}  local (${localX.toFixed(0)}, ${state.hover.y.toFixed(0)}, ${localZ.toFixed(0)})  grid ${gx},${gz}`;
+  if (localX + radius < 0 || localX - radius > REGION_SIZE || localZ + radius < 0 || localZ - radius > REGION_SIZE) return null;
+  const minGX = Math.max(0, Math.ceil((localX - radius) / CELL_SIZE));
+  const maxGX = Math.min(GRID_SIZE - 1, Math.floor((localX + radius) / CELL_SIZE));
+  const minGZ = Math.max(0, Math.ceil((localZ - radius) / CELL_SIZE));
+  const maxGZ = Math.min(GRID_SIZE - 1, Math.floor((localZ + radius) / CELL_SIZE));
+  if (minGX > maxGX || minGZ > maxGZ) return null;
+  return { localX, localZ, minGX, maxGX, minGZ, maxGZ };
 }
 
 function stampBrush(force) {
@@ -2597,18 +2818,18 @@ function stampBrush(force) {
   let changedAny = false;
 
   for (const region of state.regions.values()) {
-    const offX = regionOffsetX(region.x);
-    const offZ = regionOffsetZ(region.y);
+    const bounds = brushGridBounds(region, radius);
+    if (!bounds) continue;
     const regionKey = keyFor(region.x, region.y);
     let changed = false;
-    for (let gz = 0; gz < GRID_SIZE; gz++) {
-      for (let gx = 0; gx < GRID_SIZE; gx++) {
-        const wx = offX + 960 - gx * CELL_SIZE;
-        const wz = offZ - 960 + gz * CELL_SIZE;
-        const dx = wx - state.hover.x;
-        const dz = wz - state.hover.z;
-        const dist = Math.hypot(dx, dz);
-        if (dist > radius) continue;
+    const radius2 = radius * radius;
+    for (let gz = bounds.minGZ; gz <= bounds.maxGZ; gz++) {
+      const dz = gz * CELL_SIZE - bounds.localZ;
+      for (let gx = bounds.minGX; gx <= bounds.maxGX; gx++) {
+        const dx = bounds.localX - gx * CELL_SIZE;
+        const dist2 = dx * dx + dz * dz;
+        if (dist2 > radius2) continue;
+        const dist = Math.sqrt(dist2);
         const t = dist / radius;
         const weight = 1 - t * t * (3 - 2 * t);
         const idx = gz * GRID_SIZE + gx;
@@ -2640,31 +2861,36 @@ function stampTileBrush(radius) {
     setStatus("Pick a tile in the panel first");
     return;
   }
-  const id = state.activeTileID & 0x3FF;
+  const id = state.activeTileID & 0x7FF;
   let changedAny = false;
   for (const region of state.regions.values()) {
-    const offX = regionOffsetX(region.x);
-    const offZ = regionOffsetZ(region.y);
+    const bounds = brushGridBounds(region, radius);
+    if (!bounds) continue;
     const regionKey = keyFor(region.x, region.y);
     let changed = false;
-    for (let gz = 0; gz < GRID_SIZE; gz++) {
-      for (let gx = 0; gx < GRID_SIZE; gx++) {
-        const wx = offX + 960 - gx * CELL_SIZE;
-        const wz = offZ - 960 + gz * CELL_SIZE;
-        const dx = wx - state.hover.x;
-        const dz = wz - state.hover.z;
-        if (Math.hypot(dx, dz) > radius) continue;
+    let minGX = GRID_SIZE, minGZ = GRID_SIZE, maxGX = -1, maxGZ = -1;
+    const radius2 = radius * radius;
+    for (let gz = bounds.minGZ; gz <= bounds.maxGZ; gz++) {
+      const dz = gz * CELL_SIZE - bounds.localZ;
+      for (let gx = bounds.minGX; gx <= bounds.maxGX; gx++) {
+        const dx = bounds.localX - gx * CELL_SIZE;
+        if (dx * dx + dz * dz > radius2) continue;
         const idx = gz * GRID_SIZE + gx;
         if (region.tileIDs[idx] !== id) {
           recordBrushVertex(regionKey, idx, region.tileIDs[idx]);
           region.tileIDs[idx] = id;
           changed = true;
+          minGX = Math.min(minGX, gx);
+          minGZ = Math.min(minGZ, gz);
+          maxGX = Math.max(maxGX, gx);
+          maxGZ = Math.max(maxGZ, gz);
         }
       }
     }
     if (changed) {
       state.dirty.add(regionKey);
       state.tileDirty.add(regionKey);
+      scheduleTilePreviewRefresh(region, vertexBoundsToTexturePatch(minGX, minGZ, maxGX, maxGZ));
       changedAny = true;
     }
   }
@@ -2879,6 +3105,31 @@ function drawLineBatch(buffer, verts, color) {
 
 function drawObjectCollisionOverlay(viewProj) {
   if (state.objectPlacements.length === 0) return;
+  if (state.collisionOverlayDirty) rebuildCollisionOverlayBuffers();
+  if (state.collisionFillCount === 0) return;
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.useProgram(flatProgram.program);
+  gl.uniformMatrix4fv(flatProgram.uniforms.uViewProj, false, viewProj);
+  gl.uniform4fv(flatProgram.uniforms.uColor, [1.0, 0.05, 0.02, 0.32]);
+  gl.bindBuffer(gl.ARRAY_BUFFER, collisionFillBuffer);
+  bindAttribute(flatProgram.attributes.aPosition, collisionFillBuffer, 3);
+  gl.drawArrays(gl.TRIANGLES, 0, state.collisionFillCount);
+
+  gl.disable(gl.BLEND);
+  gl.useProgram(lineProgram.program);
+  gl.uniformMatrix4fv(lineProgram.uniforms.uViewProj, false, viewProj);
+  gl.uniform3fv(lineProgram.uniforms.uColor, [1.0, 0.18, 0.12]);
+  gl.bindBuffer(gl.ARRAY_BUFFER, collisionLineBuffer);
+  bindAttribute(lineProgram.attributes.aPosition, collisionLineBuffer, 3);
+  gl.drawArrays(gl.LINES, 0, state.collisionLineCount);
+  gl.enable(gl.DEPTH_TEST);
+}
+
+function rebuildCollisionOverlayBuffers() {
   const fill = [];
   const lines = [];
   for (const placement of state.objectPlacements) {
@@ -2908,29 +3159,13 @@ function drawObjectCollisionOverlay(viewProj) {
     pushLine(lines, corners[2], corners[3]);
     pushLine(lines, corners[3], corners[0]);
   }
-  if (fill.length === 0) return;
-
-  gl.disable(gl.DEPTH_TEST);
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-  gl.useProgram(flatProgram.program);
-  gl.uniformMatrix4fv(flatProgram.uniforms.uViewProj, false, viewProj);
-  gl.uniform4fv(flatProgram.uniforms.uColor, [1.0, 0.05, 0.02, 0.32]);
   gl.bindBuffer(gl.ARRAY_BUFFER, collisionFillBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fill), gl.DYNAMIC_DRAW);
-  bindAttribute(flatProgram.attributes.aPosition, collisionFillBuffer, 3);
-  gl.drawArrays(gl.TRIANGLES, 0, fill.length / 3);
-
-  gl.disable(gl.BLEND);
-  gl.useProgram(lineProgram.program);
-  gl.uniformMatrix4fv(lineProgram.uniforms.uViewProj, false, viewProj);
-  gl.uniform3fv(lineProgram.uniforms.uColor, [1.0, 0.18, 0.12]);
   gl.bindBuffer(gl.ARRAY_BUFFER, collisionLineBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lines), gl.DYNAMIC_DRAW);
-  bindAttribute(lineProgram.attributes.aPosition, collisionLineBuffer, 3);
-  gl.drawArrays(gl.LINES, 0, lines.length / 3);
-  gl.enable(gl.DEPTH_TEST);
+  state.collisionFillCount = fill.length / 3;
+  state.collisionLineCount = lines.length / 3;
+  state.collisionOverlayDirty = false;
 }
 
 function pushCollisionNavMesh(fill, lines, placement, vertices, indices, outlineIndices) {
@@ -3614,50 +3849,76 @@ function teleportToRegion(rx, ry) {
 
 function drawBrushCircle(viewProj) {
   const radius = parseFloat(ui.brushRadius.value);
-  const segments = 96;
-  const data = new Float32Array(segments * 3);
-  for (let i = 0; i < segments; i++) {
-    const a = (i / segments) * Math.PI * 2;
-    data[i * 3] = state.hover.x + Math.cos(a) * radius;
-    data[i * 3 + 1] = state.hover.y + 5;
-    data[i * 3 + 2] = state.hover.z + Math.sin(a) * radius;
+  for (let i = 0; i < BRUSH_CIRCLE_SEGMENTS; i++) {
+    brushCircleData[i * 3] = state.hover.x + BRUSH_CIRCLE_UNIT[i * 2] * radius;
+    brushCircleData[i * 3 + 1] = state.hover.y + 5;
+    brushCircleData[i * 3 + 2] = state.hover.z + BRUSH_CIRCLE_UNIT[i * 2 + 1] * radius;
   }
   gl.bindBuffer(gl.ARRAY_BUFFER, brushBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, brushCircleData, gl.DYNAMIC_DRAW);
   gl.useProgram(lineProgram.program);
   gl.uniformMatrix4fv(lineProgram.uniforms.uViewProj, false, viewProj);
   const color = state.brushMode === "raise" ? [0.45, 0.95, 0.58] : [0.95, 0.42, 0.34];
   gl.uniform3fv(lineProgram.uniforms.uColor, color);
   bindAttribute(lineProgram.attributes.aPosition, brushBuffer, 3);
   gl.disable(gl.DEPTH_TEST);
-  gl.drawArrays(gl.LINE_LOOP, 0, segments);
+  gl.drawArrays(gl.LINE_LOOP, 0, BRUSH_CIRCLE_SEGMENTS);
   gl.enable(gl.DEPTH_TEST);
 }
 
 function heightAtWorld(x, z) {
-  for (const region of state.regions.values()) {
-    const offX = regionOffsetX(region.x);
-    const offZ = regionOffsetZ(region.y);
-    const lx = offX + 960 - x;
-    const lz = z - offZ + 960;
-    if (lx < 0 || lx > REGION_SIZE || lz < 0 || lz > REGION_SIZE) continue;
-    const gx = clamp(lx / CELL_SIZE, 0, GRID_SIZE - 1);
-    const gz = clamp(lz / CELL_SIZE, 0, GRID_SIZE - 1);
-    const x0 = Math.floor(gx);
-    const z0 = Math.floor(gz);
-    const x1 = Math.min(GRID_SIZE - 1, x0 + 1);
-    const z1 = Math.min(GRID_SIZE - 1, z0 + 1);
-    const fx = gx - x0;
-    const fz = gz - z0;
-    const h00 = region.heights[z0 * GRID_SIZE + x0];
-    const h10 = region.heights[z0 * GRID_SIZE + x1];
-    const h01 = region.heights[z1 * GRID_SIZE + x0];
-    const h11 = region.heights[z1 * GRID_SIZE + x1];
-    const h0 = h00 * (1 - fx) + h10 * fx;
-    const h1 = h01 * (1 - fx) + h11 * fx;
-    return { height: h0 * (1 - fz) + h1 * fz, region };
+  const region = regionAtWorld(x, z);
+  if (!region) return null;
+  const local = localGridAtWorld(region, x, z, true);
+  if (!local) return null;
+  const x0 = Math.floor(local.gx);
+  const z0 = Math.floor(local.gz);
+  const x1 = Math.min(GRID_SIZE - 1, x0 + 1);
+  const z1 = Math.min(GRID_SIZE - 1, z0 + 1);
+  const fx = local.gx - x0;
+  const fz = local.gz - z0;
+  const h00 = region.heights[z0 * GRID_SIZE + x0];
+  const h10 = region.heights[z0 * GRID_SIZE + x1];
+  const h01 = region.heights[z1 * GRID_SIZE + x0];
+  const h11 = region.heights[z1 * GRID_SIZE + x1];
+  const h0 = h00 * (1 - fx) + h10 * fx;
+  const h1 = h01 * (1 - fx) + h11 * fx;
+  return { height: h0 * (1 - fz) + h1 * fz, region };
+}
+
+function regionAtWorld(x, z) {
+  const rx = state.baseX - Math.floor((x + 960) / REGION_SIZE);
+  const ry = state.baseY + Math.floor((z + 960) / REGION_SIZE);
+  const direct = state.regions.get(keyFor(rx, ry));
+  if (direct && localGridAtWorld(direct, x, z, false)) return direct;
+  // Boundary values can map to either neighbour depending on load order; keep
+  // a tiny fallback around the computed region without scanning all loaded regions.
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const region = state.regions.get(keyFor(rx + dx, ry + dy));
+      if (region && localGridAtWorld(region, x, z, false)) return region;
+    }
   }
   return null;
+}
+
+function localGridAtWorld(region, x, z, clampGrid) {
+  const offX = regionOffsetX(region.x);
+  const offZ = regionOffsetZ(region.y);
+  const localX = offX + 960 - x;
+  const localZ = z - offZ + 960;
+  if (!clampGrid && (localX < 0 || localX > REGION_SIZE || localZ < 0 || localZ > REGION_SIZE)) return null;
+  const gx = clampGrid ? clamp(localX / CELL_SIZE, 0, GRID_SIZE - 1) : localX / CELL_SIZE;
+  const gz = clampGrid ? clamp(localZ / CELL_SIZE, 0, GRID_SIZE - 1) : localZ / CELL_SIZE;
+  return {
+    localX,
+    localZ,
+    gx,
+    gz,
+    gxRound: Math.max(0, Math.min(GRID_SIZE - 1, Math.round(gx))),
+    gzRound: Math.max(0, Math.min(GRID_SIZE - 1, Math.round(gz)))
+  };
 }
 
 function mouseRay() {
@@ -3717,11 +3978,19 @@ function setBrushMode(mode) {
   ui.lowerMode.classList.toggle("active", mode === "lower");
   ui.equalizeMode.classList.toggle("active", mode === "equalize");
   ui.tileMode.classList.toggle("active", mode === "tile");
-  ui.tilePickerSection.hidden = (mode !== "tile");
+  // Tile picker lives in its own dock panel; visibility is owned by the panel
+  // chrome, not by brush mode. Still preload the catalog when the user picks
+  // Tile mode so it's ready when they open the panel.
   ui.equalizeStatus.hidden = (mode !== "equalize");
   refreshEqualizeStatus();
   if (mode === "tile" && !state.tileCatalog) fetchTileCatalog();
 }
+
+// Expose a tiny shim so panels.js can lazy-load the tile catalog the first
+// time the Tiles dock panel is opened (independent of brush mode).
+window.ensureTileCatalog = function () {
+  if (!state.tileCatalog) fetchTileCatalog();
+};
 
 function refreshEqualizeStatus() {
   if (!ui.equalizeStatus) return;
@@ -3739,6 +4008,10 @@ async function fetchTileCatalog() {
     const data = await fetchJSON("/api/tiles");
     state.tileCatalog = (data.entries || []).slice().sort((a, b) => a.id - b.id);
     renderTileGrid();
+    if (state.activeTileID !== null) {
+      updateActiveTileStatus(tileEntryByID(state.activeTileID), "Active");
+      return;
+    }
     ui.tileStatus.textContent = `${state.tileCatalog.length} tiles · pick one to paint`;
   } catch (err) {
     ui.tileStatus.textContent = `Failed: ${err.message}`;
@@ -3776,12 +4049,67 @@ function renderTileGrid() {
 }
 
 function selectActiveTile(entry) {
-  state.activeTileID = entry.id;
+  setToolMode("brush");
+  setBrushMode("tile");
+  state.activeTileID = entry.id & 0x7FF;
+  updateActiveTileStatus(entry, "Active");
+  return;
   ui.tileStatus.textContent = `Active: ${entry.id} · ${entry.folder}/${entry.filename}`;
   for (const cell of ui.tileGrid.querySelectorAll(".tile-cell")) cell.classList.remove("active");
   for (const cell of ui.tileGrid.querySelectorAll(".tile-cell")) {
     if (cell.title.startsWith(`${entry.id} `)) cell.classList.add("active");
   }
+}
+
+function tileEntryByID(id) {
+  if (!state.tileCatalog) return null;
+  return state.tileCatalog.find(e => e.id === id) || null;
+}
+
+function updateActiveTileStatus(entry, label) {
+  const id = state.activeTileID;
+  if (entry) {
+    ui.tileStatus.textContent = `${label}: ${entry.id} - ${entry.folder}/${entry.filename}`;
+  } else {
+    ui.tileStatus.textContent = `${label}: ${id}`;
+  }
+  for (const cell of ui.tileGrid.querySelectorAll(".tile-cell")) cell.classList.remove("active");
+  for (const cell of ui.tileGrid.querySelectorAll(".tile-cell")) {
+    if (cell.title.startsWith(`${id} `)) cell.classList.add("active");
+  }
+}
+
+function tileSampleAtHover() {
+  const region = state.hover?.region;
+  if (!region || !region.tileIDs) return null;
+  const local = hoverLocalGrid();
+  if (local) {
+    const gx = local.gxRound;
+    const gz = local.gzRound;
+    const id = region.tileIDs[gz * GRID_SIZE + gx] & 0x7FF;
+    return { id, region, gx, gz };
+  }
+  const offX = regionOffsetX(region.x);
+  const offZ = regionOffsetZ(region.y);
+  const localX = offX + 960 - state.hover.x;
+  const localZ = state.hover.z - offZ + 960;
+  const gx = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(localX / CELL_SIZE)));
+  const gz = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(localZ / CELL_SIZE)));
+  const id = region.tileIDs[gz * GRID_SIZE + gx] & 0x7FF;
+  return { id, region, gx, gz };
+}
+
+function pickTileAtHover() {
+  const sample = tileSampleAtHover();
+  if (!sample) {
+    setStatus("No terrain tile under cursor");
+    return;
+  }
+  state.activeTileID = sample.id;
+  setToolMode("brush");
+  setBrushMode("tile");
+  updateActiveTileStatus(tileEntryByID(sample.id), "Picked");
+  setStatus(`Picked tile ${sample.id} from region ${sample.region.x},${sample.region.y} grid ${sample.gx},${sample.gz}`);
 }
 
 function updateBrushLabels() {

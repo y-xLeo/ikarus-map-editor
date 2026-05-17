@@ -31,9 +31,9 @@ type textureCache struct {
 	tiles map[uint32][]byte
 	bad   map[uint32]bool
 
-	regionMu        sync.Mutex
-	regions         map[string]*regionTexture
-	regionVersions  map[string]int
+	regionMu       sync.Mutex
+	regions        map[string]*regionTexture
+	regionVersions map[string]int
 
 	lightmapMu       sync.Mutex
 	lightmaps        map[string]*lightmapEntry
@@ -182,6 +182,45 @@ func (c *textureCache) regionComposite(x, y int, mesh *sromap.Mesh) (*regionText
 	return rt, nil
 }
 
+func (c *textureCache) regionCompositeFromIDs(ids []uint16) (*regionTexture, error) {
+	composite, err := c.buildCompositeIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, composite); err != nil {
+		return nil, err
+	}
+	return &regionTexture{png: buf.Bytes(), width: composite.Bounds().Dx(), height: composite.Bounds().Dy()}, nil
+}
+
+func (c *textureCache) regionCompositePatchFromIDs(ids []uint16, minTileX, minTileZ, maxTileX, maxTileZ int) (*regionTexture, error) {
+	composite, err := c.buildCompositeIDRange(ids, minTileX, minTileZ, maxTileX, maxTileZ)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, composite); err != nil {
+		return nil, err
+	}
+	return &regionTexture{png: buf.Bytes(), width: composite.Bounds().Dx(), height: composite.Bounds().Dy()}, nil
+}
+
+func (c *textureCache) regionCompositePatchGridFromIDs(ids []uint16, minTileX, minTileZ, maxTileX, maxTileZ int) (*regionTexture, error) {
+	composite, err := c.buildCompositePatchGrid(ids, minTileX, minTileZ, maxTileX, maxTileZ)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, composite); err != nil {
+		return nil, err
+	}
+	return &regionTexture{png: buf.Bytes(), width: composite.Bounds().Dx(), height: composite.Bounds().Dy()}, nil
+}
+
 func (c *textureCache) invalidateRegion(x, y int) {
 	key := fmt.Sprintf("%d,%d", x, y)
 	c.regionMu.Lock()
@@ -250,16 +289,43 @@ func (c *textureCache) lightmapPNG(root string, x, y int) ([]byte, bool) {
 
 func (c *textureCache) buildComposite(mesh *sromap.Mesh) (*image.RGBA, error) {
 	ids, _, _ := mesh.UniqueTextureMap()
+	return c.buildCompositeIDs(ids[:])
+}
 
-	used := make(map[uint16]*sromap.DDJImage)
-	for _, id := range ids {
-		if _, ok := used[id]; ok {
-			continue
-		}
-		used[id] = c.decoded(uint32(id))
+func (c *textureCache) buildCompositeIDs(ids []uint16) (*image.RGBA, error) {
+	return c.buildCompositeIDRange(ids, 0, 0, compositeTiles-1, compositeTiles-1)
+}
+
+func (c *textureCache) buildCompositeIDRange(ids []uint16, minTileX, minTileZ, maxTileX, maxTileZ int) (*image.RGBA, error) {
+	if len(ids) != sromap.MeshGridSize*sromap.MeshGridSize {
+		return nil, fmt.Errorf("texture map must contain %d values, got %d", sromap.MeshGridSize*sromap.MeshGridSize, len(ids))
+	}
+	if minTileX < 0 || minTileZ < 0 || maxTileX >= compositeTiles || maxTileZ >= compositeTiles ||
+		minTileX > maxTileX || minTileZ > maxTileZ {
+		return nil, fmt.Errorf("invalid texture range %d,%d..%d,%d", minTileX, minTileZ, maxTileX, maxTileZ)
 	}
 
-	out := image.NewRGBA(image.Rect(0, 0, compositeSize, compositeSize))
+	used := make(map[uint16]*sromap.DDJImage)
+	addID := func(id uint16) {
+		key := id & 0x7FF
+		if _, ok := used[key]; ok {
+			return
+		}
+		used[key] = c.decoded(uint32(key))
+	}
+	for tz := minTileZ; tz <= maxTileZ; tz++ {
+		for tx := minTileX; tx <= maxTileX; tx++ {
+			i00 := tz*sromap.MeshGridSize + tx
+			addID(ids[i00])
+			addID(ids[i00+1])
+			addID(ids[i00+sromap.MeshGridSize])
+			addID(ids[i00+sromap.MeshGridSize+1])
+		}
+	}
+
+	width := (maxTileX - minTileX + 1) * compositeTileSize
+	height := (maxTileZ - minTileZ + 1) * compositeTileSize
+	out := image.NewRGBA(image.Rect(0, 0, width, height))
 	stride := out.Stride
 	pix := out.Pix
 
@@ -269,22 +335,22 @@ func (c *textureCache) buildComposite(mesh *sromap.Mesh) (*image.RGBA, error) {
 	tileSizeF := float32(tileSize)
 	tileSpan := tileSize * textureRepeat
 	tileSpanF := float32(tileSpan)
-	for tz := 0; tz < compositeTiles; tz++ {
-		for tx := 0; tx < compositeTiles; tx++ {
+	for tz := minTileZ; tz <= maxTileZ; tz++ {
+		for tx := minTileX; tx <= maxTileX; tx++ {
 			i00 := tz*sromap.MeshGridSize + tx
 			i10 := i00 + 1
 			i01 := i00 + sromap.MeshGridSize
 			i11 := i01 + 1
 
-			tex00 := used[ids[i00]]
-			tex10 := used[ids[i10]]
-			tex01 := used[ids[i01]]
-			tex11 := used[ids[i11]]
+			tex00 := used[ids[i00]&0x7FF]
+			tex10 := used[ids[i10]&0x7FF]
+			tex01 := used[ids[i01]&0x7FF]
+			tex11 := used[ids[i11]&0x7FF]
 
 			for py := 0; py < tileSize; py++ {
 				blendV := (float32(py) + 0.5) / tileSizeF
 				oneBlendV := 1 - blendV
-				outY := tz*tileSize + py
+				outY := (tz-minTileZ)*tileSize + py
 				texV := (float32((tz*tileSize+py)%tileSpan) + 0.5) / tileSpanF
 				for px := 0; px < tileSize; px++ {
 					blendU := (float32(px) + 0.5) / tileSizeF
@@ -305,7 +371,93 @@ func (c *textureCache) buildComposite(mesh *sromap.Mesh) (*image.RGBA, error) {
 					g := float32(g00)*w00 + float32(g10)*w10 + float32(g01)*w01 + float32(g11)*w11
 					b := float32(bl00)*w00 + float32(bl10)*w10 + float32(bl01)*w01 + float32(bl11)*w11
 
-					outX := tx*tileSize + px
+					outX := (tx-minTileX)*tileSize + px
+					off := outY*stride + outX*4
+					pix[off] = clampByte(r)
+					pix[off+1] = clampByte(g)
+					pix[off+2] = clampByte(b)
+					pix[off+3] = 255
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+func (c *textureCache) buildCompositePatchGrid(ids []uint16, minTileX, minTileZ, maxTileX, maxTileZ int) (*image.RGBA, error) {
+	if minTileX < 0 || minTileZ < 0 || maxTileX >= compositeTiles || maxTileZ >= compositeTiles ||
+		minTileX > maxTileX || minTileZ > maxTileZ {
+		return nil, fmt.Errorf("invalid texture range %d,%d..%d,%d", minTileX, minTileZ, maxTileX, maxTileZ)
+	}
+	tileW := maxTileX - minTileX + 1
+	tileH := maxTileZ - minTileZ + 1
+	gridW := tileW + 1
+	gridH := tileH + 1
+	if len(ids) != gridW*gridH {
+		return nil, fmt.Errorf("texture patch must contain %d values, got %d", gridW*gridH, len(ids))
+	}
+
+	used := make(map[uint16]*sromap.DDJImage)
+	addID := func(id uint16) {
+		key := id & 0x7FF
+		if _, ok := used[key]; ok {
+			return
+		}
+		used[key] = c.decoded(uint32(key))
+	}
+	for _, id := range ids {
+		addID(id)
+	}
+
+	out := image.NewRGBA(image.Rect(0, 0, tileW*compositeTileSize, tileH*compositeTileSize))
+	stride := out.Stride
+	pix := out.Pix
+
+	fallback := color.RGBA{96, 84, 64, 255}
+
+	tileSize := compositeTileSize
+	tileSizeF := float32(tileSize)
+	tileSpan := tileSize * textureRepeat
+	tileSpanF := float32(tileSpan)
+	for tz := minTileZ; tz <= maxTileZ; tz++ {
+		lz := tz - minTileZ
+		for tx := minTileX; tx <= maxTileX; tx++ {
+			lx := tx - minTileX
+			i00 := lz*gridW + lx
+			i10 := i00 + 1
+			i01 := i00 + gridW
+			i11 := i01 + 1
+
+			tex00 := used[ids[i00]&0x7FF]
+			tex10 := used[ids[i10]&0x7FF]
+			tex01 := used[ids[i01]&0x7FF]
+			tex11 := used[ids[i11]&0x7FF]
+
+			for py := 0; py < tileSize; py++ {
+				blendV := (float32(py) + 0.5) / tileSizeF
+				oneBlendV := 1 - blendV
+				outY := lz*tileSize + py
+				texV := (float32((tz*tileSize+py)%tileSpan) + 0.5) / tileSpanF
+				for px := 0; px < tileSize; px++ {
+					blendU := (float32(px) + 0.5) / tileSizeF
+					oneBlendU := 1 - blendU
+					w00 := oneBlendU * oneBlendV
+					w10 := blendU * oneBlendV
+					w01 := oneBlendU * blendV
+					w11 := blendU * blendV
+
+					texU := (float32((tx*tileSize+px)%tileSpan) + 0.5) / tileSpanF
+
+					r00, g00, bl00 := sampleNearest(tex00, texU, texV, fallback)
+					r10, g10, bl10 := sampleNearest(tex10, texU, texV, fallback)
+					r01, g01, bl01 := sampleNearest(tex01, texU, texV, fallback)
+					r11, g11, bl11 := sampleNearest(tex11, texU, texV, fallback)
+
+					r := float32(r00)*w00 + float32(r10)*w10 + float32(r01)*w01 + float32(r11)*w11
+					g := float32(g00)*w00 + float32(g10)*w10 + float32(g01)*w01 + float32(g11)*w11
+					b := float32(bl00)*w00 + float32(bl10)*w10 + float32(bl01)*w01 + float32(bl11)*w11
+
+					outX := lx*tileSize + px
 					off := outY*stride + outX*4
 					pix[off] = clampByte(r)
 					pix[off+1] = clampByte(g)
